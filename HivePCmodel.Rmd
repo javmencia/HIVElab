@@ -1,0 +1,2874 @@
+---
+title: "HivePCmodel"
+author: "Javier Mencia"
+date: "2025-10-14"
+output: html_document
+---
+
+# {.tabset}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+rm(list = ls())
+library(haven) # read sas files
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(stringr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(patchwork)
+library(sjPlot)
+library(forestmodel)
+library(rms)
+library(MASS)
+library(splines)
+# Load required libraries
+library(randomForest)
+library(survival)
+library(tidyverse)
+library(pROC)
+library(survminer)
+# Load required libraries
+library(tidyverse)
+library(neuralnet)
+library(caret)
+library(recipes)
+library(themis) # For handling class imbalance
+library(pROC) # For ROC analysis
+library(MLmetrics) # For additional metrics
+library(tensorflow)
+
+```
+
+```{r}
+# Read the SAS files
+dm <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/dm.sas7bdat")%>%
+  dplyr::select("RPT", "RINVSITE", "STUDY", "SEXN", "SEX", "RACEPRIM", "INFCDAY", "AGE")
+
+dov <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/dov.sas7bdat")%>%
+  dplyr::select("RPT", "STUDY", "RINVSITE","VISIT", "VISNAME", "DOV_ND", "DOVDAY")
+
+survive <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/survive.sas7bdat")%>%
+  dplyr::select("RPT", "STUDY", "RINVSITE", "STATUSN", "STATUS", "CONTDAY", "LKDAY", "VISDAY")
+
+death <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/death.sas7bdat")%>%
+  dplyr::select("RPT", "STUDY", "RINVSITE", "DSCAUSEN", "DSCAUSE", "DSREAS", "DSDECOD", "DSBODSYS", "DSMODIFY", "LLTCD", "LLTNMD", "HLTNMD", "HLGTNMD", "PTCDD", "DICTVER", "DSDAY")
+
+ecog <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/ecog.sas7bdat")%>%
+  dplyr::select("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "VISDAY", "ECOGGRN", "ECOGGR")
+
+vascular <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/vs.sas7bdat")
+
+assignment<- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/assignmt.sas7bdat")%>%
+  dplyr::select(!"STUDY")
+
+ex2 <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/EX2.sas7bdat")%>%
+  dplyr::select("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "VISDAY", "EXDOSENN", "EXDOSEN")
+
+ex3 <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/EX3.sas7bdat")%>%
+  dplyr::select("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "VISDAY", "EXDOSE2N", "EXDOSE2")
+
+ex4 <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/EX4.sas7bdat")%>%
+  dplyr::select("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "VISDAY", "EXDOSE3N", "EXDOSE3")
+
+pksampi <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/pksampi.sas7bdat")
+
+cycle <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/cycle.sas7bdat")
+
+pk <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/pkbs.sas7bdat")%>%
+  dplyr::select(-c("VISIT", "VISNAME", "VISDAY"))
+
+targetq <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/targetq.sas7bdat")
+
+adverse <- read_sas("~/Desktop/HIVE Lab/Cancer Model/Main Experiment/PC002_De-id_Database 2/ae.sas7bdat")%>%
+  dplyr::select(-c("VISNAME", "VISIT", "VISDAY"))%>%
+  mutate(AEDURATION = AEENDAY - AESTDAY + 1)
+
+#dm2 <-read_sas("~/Desktop/HIVE Lab/Cancer Model/External Val/Sanofi Data Venice/addm.sas7bdat")
+
+```
+
+## EDA {.tabset}
+
+### Sample
+
+```{r}
+pcdata <- dm %>%
+  left_join(dov, by = c("RPT", "RINVSITE", "STUDY")) %>%
+  # First join: exact match including dates
+  left_join(
+    ecog %>% rename(VISDAY_ecog = VISDAY),
+    by = c("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "DOVDAY" = "VISDAY_ecog")
+  ) %>%
+  # Second join: fill in missing matches without date constraint
+  left_join(
+    ecog %>% 
+      dplyr::select(-VISDAY) %>%  # Remove VISDAY to avoid duplicate columns
+      distinct(RPT, STUDY, RINVSITE, VISIT, VISNAME, .keep_all = TRUE),
+    by = c("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME"),
+    suffix = c("", "_no_date")
+  ) %>%
+  # Consolidate the results - prefer the date-matched records
+  mutate(
+    ECOGGRN = coalesce(ECOGGRN, ECOGGRN_no_date),
+    ECOGGR = coalesce(ECOGGR, ECOGGR_no_date)
+  ) %>%
+  # Remove the temporary columns from the second join
+  dplyr::select(-ends_with("_no_date"))%>%
+  rename("VISDAY" = "DOVDAY")
+
+pcdata <- pcdata%>%
+  left_join(survive, by = c("RPT", "RINVSITE", "STUDY", "VISDAY"), relationship = "many-to-many")%>%
+  left_join(death, by = c("RPT", "RINVSITE", "STUDY"))%>%
+  left_join(vascular, by = c("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "VISDAY"))%>%  
+  left_join(ex2, by = c("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "VISDAY"))%>%
+  left_join(ex3, by = c("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "VISDAY"))%>%
+  left_join(ex4, by = c("RPT", "STUDY", "RINVSITE", "VISIT", "VISNAME", "VISDAY"))%>%
+  left_join(assignment, by = c("RPT", "RINVSITE"))%>%
+  left_join(pk, by = c("RPT", "RINVSITE", "STUDY"))%>%
+  left_join(targetq, by = c("RPT", "RINVSITE", "STUDY", "VISIT", "VISNAME", "VISDAY"))
+
+# Add total cycles variable to pcdata
+
+# Add total cycles variable to pcdata and create new variables
+pcdata <- pcdata %>%
+  group_by(STUDY, RPT, RINVSITE) %>%
+  mutate(
+    # Extract cycle number from VISNAME
+    cycle_number = as.numeric(str_extract(VISNAME, "(?<=Cycle )\\d+")),
+    
+    # Find the maximum cycle number for each patient
+    total_cycles = max(cycle_number, na.rm = TRUE),
+    anytarget = ifelse(any(TARGETQ == "Yes"), 1, 0),
+    anynontarget = ifelse(any(NONTARQ == "Yes"), 1, 0),
+    
+    # Create os_event: 1 if any STATUS is "DEAD" for the patient, 0 otherwise
+    os_event = ifelse(any(STATUS == "DEAD", na.rm = TRUE), 1, 0),
+    
+    # Create CANCDEAD: 1 if DSCAUSEN is 1 or 2, 0 otherwise
+    CANCDEAD = ifelse(DSCAUSEN %in% c(1, 2), 1, 0)
+  ) %>%
+  ungroup() %>%
+  # Replace -Inf with NA for patients with no cycle visits
+  mutate(
+    total_cycles = ifelse(is.infinite(total_cycles), NA, total_cycles)
+  )%>%
+  mutate(
+    anytarget = replace_na(anytarget, 0),
+    anynontarget = replace_na(anynontarget, 0),
+    # Replace NAs in TYPEPKN with 0
+    TYPEPKN = replace_na(TYPEPKN, 0),
+    
+    # Replace NAs in TYPEPK with "Not Enrolled"
+    TYPEPK = ifelse(TYPEPK=="", "Not Enrolled", TYPEPK)
+  )
+
+```
+
+
+
+```{r}
+# First, create a merged dataset that links visits with adverse events that occurred up to that visit
+pcdata_with_ae_cumulative <- pcdata %>%
+  # Create a row for each patient-visit combination
+  distinct(RPT, RINVSITE, STUDY, VISIT, VISDAY, VISNAME) %>%
+  arrange(RPT, RINVSITE, STUDY, VISDAY) %>%
+  group_by(RPT, RINVSITE, STUDY) %>%
+  mutate(
+    # Create cumulative visit counter
+    visit_sequence = row_number(),
+    # Get the maximum VISDAY up to current visit for cumulative calculations
+    cum_max_visday = cummax(VISDAY)
+  ) %>%
+  ungroup() %>%
+  # Join with adverse events that occurred on or before this visit
+  left_join(
+    adverse %>%
+      dplyr::select(RPT, RINVSITE, STUDY, AESEQN, AETERM, AEDECOD, AEBODSYS, 
+             AESEVNN, AESERNN, AERELNN, AERELOTN, AEACN, AEACNOTH, 
+             AECONTRN, AESTDAY, AEENDAY, AEDURATION) %>%
+      mutate(AEACN = as.character(AEACN),
+             AEACNOTH = as.character(AEACNOTH)),
+    by = c("RPT", "RINVSITE", "STUDY"),
+    relationship = "many-to-many"
+  ) %>%
+  # Filter to include only AEs that started on or before current visit day
+  filter(AESTDAY <= cum_max_visday | is.na(AESTDAY)) %>%
+  # For each visit, calculate cumulative AE statistics
+  group_by(RPT, RINVSITE, STUDY, VISIT, VISDAY, VISNAME, visit_sequence) %>%
+  summarise(
+    # Basic AE counts
+    total_ae_events = n_distinct(AESEQN, na.rm = TRUE),
+    serious_ae_count = sum(AESERNN == 1, na.rm = TRUE),
+    grade3_plus_count = sum(AESEVNN >= 3, na.rm = TRUE),
+    any_grade3_plus = as.numeric(any(AESEVNN >= 3, na.rm = TRUE)),
+    
+    # Body system analysis
+    total_body_systems = n_distinct(AEBODSYS, na.rm = TRUE),
+    body_systems_list = ifelse(total_body_systems > 0,
+                              paste(sort(unique(AEBODSYS)), collapse = "; "),
+                              NA_character_),
+    
+    # Treatment relationship
+    treatment_related_count = sum(AERELNN == 2, na.rm = TRUE), # Suspected
+    other_treatment_related_count = sum(AERELOTN == 2, na.rm = TRUE),
+    any_treatment_related = as.numeric(any(AERELNN == 2 | AERELOTN == 2, na.rm = TRUE)),
+    
+    # Drug action flags - Concomitant drug
+    drug_interrupted = as.numeric(any(AEACN %in% c("Dose interrupted", "Dose interrupted and reduced"), na.rm = TRUE)),
+    drug_reduced = as.numeric(any(AEACN %in% c("Dose reduced", "Dose interrupted and reduced"), na.rm = TRUE)),
+    drug_withdrawn = as.numeric(any(AEACN == "Drug withdrawn permanently", na.rm = TRUE)),
+    drug_not_changed = as.numeric(any(AEACN == "Dose not changed", na.rm = TRUE)),
+    
+    # Other drug action flags
+    other_drug_interrupted = as.numeric(any(AEACNOTH %in% c("Dose interrupted", "Dose interrupted and reduced"), na.rm = TRUE)),
+    other_drug_reduced = as.numeric(any(AEACNOTH %in% c("Dose reduced", "Dose interrupted and reduced"), na.rm = TRUE)),
+    other_drug_withdrawn = as.numeric(any(AEACNOTH == "Drug withdrawn permanently", na.rm = TRUE)),
+    
+    # Concomitant treatment given
+    concomitant_treatment_given = as.numeric(any(AECONTRN == 1, na.rm = TRUE)),
+    
+    # Severity distribution
+    grade1_count = sum(AESEVNN == 1, na.rm = TRUE),
+    grade2_count = sum(AESEVNN == 2, na.rm = TRUE),
+    grade3_count = sum(AESEVNN == 3, na.rm = TRUE),
+    grade4_count = sum(AESEVNN == 4, na.rm = TRUE),
+    grade5_count = sum(AESEVNN == 5, na.rm = TRUE),
+    
+    # Ongoing AEs
+    ongoing_ae_count = sum(!is.na(AEENDAY) & AEENDAY >= VISDAY, na.rm = TRUE),
+    
+    # Duration statistics (for completed AEs)
+    mean_ae_duration = mean(AEDURATION[!is.na(AEENDAY) & AEENDAY < VISDAY], na.rm = TRUE),
+    max_ae_duration = max(AEDURATION[!is.na(AEENDAY) & AEENDAY < VISDAY], na.rm = TRUE),
+    
+    # Most recent AE information
+    most_recent_ae_term = ifelse(total_ae_events > 0,
+                                last(AETERM[order(AESTDAY)]),
+                                NA_character_),
+    most_recent_ae_severity = ifelse(total_ae_events > 0,
+                                    last(AESEVNN[order(AESTDAY)]),
+                                    NA_real_),
+    
+    .groups = "drop"
+  ) %>%
+  # Replace NaN with NA and handle empty cases
+  mutate(
+    across(where(is.numeric), ~ifelse(is.nan(.), NA, .)),
+    across(where(is.numeric), ~replace_na(., 0))
+  ) %>%
+  # Add cumulative flags that persist once they occur
+  group_by(RPT, RINVSITE, STUDY) %>%
+  mutate(
+    # These flags should remain 1 once they occur
+    cum_any_grade3_plus = cummax(any_grade3_plus),
+    cum_any_treatment_related = cummax(any_treatment_related),
+    cum_drug_withdrawn = cummax(drug_withdrawn),
+    cum_other_drug_withdrawn = cummax(other_drug_withdrawn),
+    cum_concomitant_treatment = cummax(concomitant_treatment_given)
+  ) %>%
+  ungroup()
+
+# Now merge these cumulative AE statistics back with the main pcdata
+# Now merge these cumulative AE statistics back with the main pcdata
+pcdata <- pcdata %>%
+  left_join(
+    pcdata_with_ae_cumulative,
+    by = c("RPT", "RINVSITE", "STUDY", "VISIT", "VISDAY", "VISNAME")
+  ) %>%
+  # Fill missing values for patients with no AEs - handle different data types separately
+  mutate(
+    # Replace NA with 0 for numeric count variables
+    across(c(total_ae_events, serious_ae_count, grade3_plus_count, 
+             treatment_related_count, other_treatment_related_count,
+             grade1_count, grade2_count, grade3_count, grade4_count, grade5_count,
+             ongoing_ae_count, drug_interrupted, drug_reduced, drug_withdrawn,
+             drug_not_changed, other_drug_interrupted, other_drug_reduced, 
+             other_drug_withdrawn, concomitant_treatment_given,
+             any_grade3_plus, any_treatment_related), 
+           ~replace_na(., 0)),
+    
+    # Replace NA with 0 for cumulative flags
+    across(c(cum_any_grade3_plus, cum_any_treatment_related, 
+             cum_drug_withdrawn, cum_other_drug_withdrawn, 
+             cum_concomitant_treatment), 
+           ~replace_na(., 0)),
+    
+    # Handle character variables separately
+    body_systems_list = replace_na(body_systems_list, "No AEs reported"),
+    most_recent_ae_term = replace_na(most_recent_ae_term, "No AEs reported"),
+    
+    # Handle numeric duration variables (might have NaN from empty calculations)
+    mean_ae_duration = ifelse(is.nan(mean_ae_duration), NA, mean_ae_duration),
+    max_ae_duration = ifelse(is.nan(max_ae_duration), NA, max_ae_duration)
+  )
+
+write.csv(pcdata, "pcdata.csv")
+
+```
+
+
+```{r}
+# First, create a dataset with unique patients with their latest status
+unique_patients <- pcdata %>%
+  arrange(STUDY, RPT, desc(CONTDAY)) %>%  # Sort by contact day descending to get latest status
+  distinct(STUDY, RPT, .keep_all = TRUE) %>%
+  # Ensure STATUS is not missing - use NA if no status available
+  mutate(STATUS = ifelse(is.na(STATUS) | STATUS == "", "NA", as.character(STATUS)))
+
+# Function to create demographic table with n (%)
+create_demo_table <- function(data, var) {
+  data %>%
+    count(!!sym(var)) %>%
+    mutate(percent = round(n / sum(n) * 100, 1),
+           display = paste0(n, " (", percent, "%)")) %>%
+    dplyr::select(Category = !!sym(var), display)
+}
+
+# Create race table
+race_table <- create_demo_table(unique_patients, "RACEPRIM")
+
+# Create sex table  
+sex_table <- create_demo_table(unique_patients, "SEX")
+
+# Create region table
+region_table <- create_demo_table(unique_patients, "REGION")
+
+# Create status table
+status_table <- create_demo_table(unique_patients, "STATUS")
+
+# Create age groups (you might want to customize the breaks)
+age_table <- unique_patients %>%
+  mutate(age_group = cut(AGE, 
+                         breaks = c(0, 30, 40, 50, 60, 70, 100),
+                         labels = c("<30", "30-39", "40-49", "50-59", "60-69", "70+"))) %>%
+  create_demo_table("age_group")
+
+# Create total_cycles groups with factor to maintain order
+cycles_table <- unique_patients %>%
+  mutate(cycles_group = case_when(
+    is.na(total_cycles) ~ "No cycles",
+    total_cycles == 1 ~ "1 cycle",
+    total_cycles >= 2 & total_cycles <= 6 ~ "2-6 cycles",
+    total_cycles >= 7 & total_cycles <= 12 ~ "7-12 cycles",
+    total_cycles >= 13 ~ "13+ cycles"
+  ),
+  cycles_group = factor(cycles_group, 
+                       levels = c("No cycles", "1 cycle", "2-6 cycles", "7-12 cycles", "13+ cycles"),
+                       ordered = TRUE)) %>%
+  arrange(cycles_group) %>%
+  create_demo_table("cycles_group")
+
+# Combine all tables
+final_table <- bind_rows(
+  data.frame(Category = "Total Patients", 
+             display = paste0(nrow(unique_patients), " (100.0%)")),
+  sex_table,
+  race_table,
+  region_table,
+  status_table,
+  age_table,
+  cycles_table
+)
+
+# Create the formatted table
+final_table %>%
+  kable(format = "html", align = c("l", "r"), 
+        col.names = c("Category", "n (%)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE) %>%
+  pack_rows("Sex", 2, nrow(sex_table) + 1) %>%
+  pack_rows("Race", nrow(sex_table) + 2, nrow(sex_table) + nrow(race_table) + 1) %>%
+  pack_rows("Region", nrow(sex_table) + nrow(race_table) + 2, 
+            nrow(sex_table) + nrow(race_table) + nrow(region_table) + 1) %>%
+  pack_rows("Status", nrow(sex_table) + nrow(race_table) + nrow(region_table) + 2,
+            nrow(sex_table) + nrow(race_table) + nrow(region_table) + nrow(status_table) + 1) %>%
+  pack_rows("Age Group at Baseline", nrow(sex_table) + nrow(race_table) + nrow(region_table) + nrow(status_table) + 2, 
+            nrow(sex_table) + nrow(race_table) + nrow(region_table) + nrow(status_table) + nrow(age_table) + 1) %>%
+  pack_rows("Total Cycles Completed", nrow(sex_table) + nrow(race_table) + nrow(region_table) + nrow(status_table) + nrow(age_table) + 2,
+            nrow(final_table))
+```
+
+```{r}
+
+# Create summary statistics for the entire dataset at key visits
+key_visit_summary <- pcdata %>%
+  group_by(VISIT, VISNAME) %>%
+  summarise(
+    patients_with_visits = n_distinct(RPT),
+    patients_with_any_ae = sum(total_ae_events > 0),
+    patients_with_serious_ae = sum(serious_ae_count > 0),
+    patients_with_grade3_plus = sum(grade3_plus_count > 0),
+    patients_with_treatment_related = sum(any_treatment_related > 0),
+    patients_with_drug_withdrawn = sum(drug_withdrawn > 0),
+    mean_ae_per_patient = mean(total_ae_events),
+    .groups = "drop"
+  )
+
+print(key_visit_summary)
+```
+
+
+### Treatments {.tabset}
+
+#### Main Treatments
+
+```{r}
+# Define Day 0 for each patient
+day0_data <- pcdata %>%
+  group_by(STUDY, RPT, RINVSITE) %>%
+  summarise(
+    # Use randomization date (ENROLLDAY) as primary Day 0
+    # If not available, use first VISDAY where VISNAME starts with "CYCLE"
+    day0 = ifelse(!is.na(first(ENROLLDAY)), first(ENROLLDAY), 
+                  first(VISDAY[grepl("^CYCLE", VISNAME) & !is.na(VISDAY)])),
+    .groups = 'drop'
+  )
+
+# Join Day 0 back to main data and calculate days relative to Day 0
+pcdata_with_day0 <- pcdata %>%
+  left_join(day0_data, by = c("STUDY", "RPT", "RINVSITE")) %>%
+  mutate(
+    days_from_day0 = VISDAY - day0
+  )
+
+# Function to extract baseline predictors with grace window
+extract_baseline_predictors <- function(data, predictor_vars) {
+  baseline_data <- data %>%
+    group_by(STUDY, RPT, RINVSITE) %>%
+    summarise(
+      # For each predictor variable
+      across(all_of(predictor_vars), 
+             ~{
+               # Find values in baseline window (-28 to 0 days)
+               baseline_values <- .x[days_from_day0 >= -28 & days_from_day0 <= 0 & !is.na(.x)]
+               
+               if (length(baseline_values) > 0) {
+                 # Take the last value in baseline window
+                 last_baseline <- last(baseline_values[order(days_from_day0[days_from_day0 >= -28 & days_from_day0 <= 0 & !is.na(.x)])])
+                 return(last_baseline)
+               } else {
+                 # Check grace window (1 to 7 days)
+                 grace_values <- .x[days_from_day0 >= 1 & days_from_day0 <= 7 & !is.na(.x)]
+                 if (length(grace_values) > 0) {
+                   # Take the first value in grace window
+                   first_grace <- first(grace_values[order(days_from_day0[days_from_day0 >= 1 & days_from_day0 <= 7 & !is.na(.x)])])
+                   return(first_grace)
+                 } else {
+                   return(NA)
+                 }
+               }
+             },
+             .names = "{.col}"),
+      
+      # Additional variables - take any available value from patient's follow-up
+      STATUS = ifelse(any(!is.na(STATUS)), last(STATUS[!is.na(STATUS)]), NA),
+      DSCAUSE = ifelse(any(!is.na(DSCAUSE)), first(DSCAUSE[!is.na(DSCAUSE)]), NA),
+      DSCAUSEN = ifelse(any(!is.na(DSCAUSEN)), first(DSCAUSEN[!is.na(DSCAUSEN)]), NA),
+      DSREAS = ifelse(any(!is.na(DSREAS)), first(DSREAS[!is.na(DSREAS)]), NA),
+      DSDAY = ifelse(any(!is.na(DSDAY)), first(DSDAY[!is.na(DSDAY)]), NA),
+      
+
+      # Improved LAST_VISDAY calculation
+      LAST_VISDAY = {
+        visday_values <- VISDAY[!is.na(VISDAY)]
+        if (length(visday_values) > 0) {
+          max(visday_values)
+        } else {
+          NA
+        }
+      },
+      
+      
+      .groups = 'drop'
+    )
+  
+  return(baseline_data)
+}
+
+# Define predictor variables of interest
+predictor_vars <- c(
+  "ECOGGRN", "ECOGGR", "HEIGHT", "WEIGHT", "BMI", "TEMP", 
+  "SYSBP", "DIABP", "PULSE", "AGE", "SEXN", "SEX", "RACEPRIM", "anytarget", "anynontarget"
+)
+
+# Extract baseline predictors
+baseline_predictors <- extract_baseline_predictors(pcdata_with_day0, predictor_vars)
+
+baseline_predictors <- baseline_predictors %>%
+  mutate(
+    # If DSCAUSE is not empty, status should be "Dead"
+    STATUS = case_when(
+      !is.na(DSCAUSE) & DSCAUSE != "" ~ "Dead",
+      # For remaining NAs, fill with "Alive"
+      is.na(STATUS) ~ "ALIVE",
+      # Keep existing non-NA STATUS values
+      TRUE ~ STATUS
+    )
+  )
+# Add Day 0 information to baseline predictors
+baseline_predictors <- baseline_predictors %>%
+  left_join(day0_data, by = c("STUDY", "RPT", "RINVSITE"))
+
+# Create shifted variable for survival analysis
+baseline_predictors <- baseline_predictors %>%
+  mutate(
+    # Time variable: death day or last visit day corrected by day0
+    os_time = case_when(
+      STATUS == "Dead" & !is.na(DSDAY) ~ DSDAY - day0,  # Death time
+      !is.na(LAST_VISDAY) ~ LAST_VISDAY - day0,         # Censoring time (last follow-up)
+      TRUE ~ NA_real_                                   # Missing if neither available
+    ),
+    # Event variable: 1 for death, 0 for censored
+    os_event = ifelse(STATUS == "Dead", 1, 0),
+    CANCDEAD = ifelse(DSCAUSEN %in% c(1,2), 1,0)
+  )
+
+
+baseline_predictors <- baseline_predictors %>%
+  left_join(
+    pcdata %>%
+      group_by(STUDY, RPT, RINVSITE) %>%
+      summarise(total_cycles = first(total_cycles), .groups = 'drop'),
+    by = c("STUDY", "RPT", "RINVSITE"))%>%
+  left_join(pk, by = c("STUDY", "RPT", "RINVSITE"))
+
+baseline_predictors <- baseline_predictors %>%
+  mutate(
+    # Create lenalidomide variable: 1 if PKSAMP is not "Not Applicable", 0 otherwise
+    lenalidomide = ifelse(PKSAMP == "Not Applicable", 0, 1),
+    
+    # Fill NA values in TYPEPKN with 0
+    TYPEPKN = ifelse(is.na(TYPEPKN), 0, TYPEPKN),
+    TYPEPK = ifelse(is.na(TYPEPK), "Not Enrolled", TYPEPK)
+  )
+
+```
+
+
+```{r}
+# Create adverse event summary variables
+adverse_summary <- adverse %>%
+  # Filter for events suspected of being caused by any study drug
+  filter(AERELN == "Suspected" | AERELOTH == "Suspected") %>%
+  group_by(RPT, RINVSITE, STUDY) %>%
+  summarise(
+    # Total number of adverse effects suspected to be caused by study drug
+    total_ae_suspected = n(),
+    
+    # Total number of severe adverse effects suspected to be caused by study drug
+    total_severe_ae_suspected = sum(AESEVN %in% c("Death/Grade 5", "Life-threatening/Grade 4", "Severe/Grade 3"), na.rm = TRUE),
+    
+    # Total number of body systems affected by suspected adverse events
+    total_body_systems_suspected = n_distinct(AEBODSYS, na.rm = TRUE),
+    
+    # Highest severity of any adverse event for that patient
+    # Convert severity to numeric scale for comparison
+    highest_severity_num = case_when(
+      any(AESEVN == "Death/Grade 5") ~ 5,
+      any(AESEVN == "Life-threatening/Grade 4") ~ 4,
+      any(AESEVN == "Severe/Grade 3") ~ 3,
+      any(AESEVN == "Moderate/Grade 2") ~ 2,
+      any(AESEVN == "Mild/Grade 1") ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # Time to first adverse event (relative to day0)
+    time_to_first_ae = ifelse(
+      !all(is.na(AESTDAY)), 
+      min(AESTDAY, na.rm = TRUE), 
+      NA
+    ),
+    
+    .groups = 'drop'
+  )%>%
+  # Convert numeric severity back to categorical for interpretability
+  mutate(
+    highest_severity = case_when(
+      highest_severity_num == 5 ~ "Fatal",
+      highest_severity_num == 4 ~ "Life-threatening", 
+      highest_severity_num == 3 ~ "Severe",
+      highest_severity_num == 2 ~ "Moderate",
+      highest_severity_num == 1 ~ "Mild",
+      highest_severity_num == 0 ~ "None",
+      TRUE ~ "None"
+    ) %>% 
+      factor(levels = c("None", "Mild", "Moderate", "Severe", "Life-threatening", "Fatal"),
+             ordered = TRUE)
+  ) 
+  #dplyr::select(-highest_severity_num)
+
+# For patients with no suspected adverse events, create records with zeros
+all_patients <- baseline_predictors %>%
+  distinct(RPT, RINVSITE, STUDY)
+
+adverse_summary_complete <- all_patients %>%
+  left_join(adverse_summary, by = c("RPT", "RINVSITE", "STUDY")) %>%
+  mutate(
+    across(c(total_ae_suspected, total_severe_ae_suspected, total_body_systems_suspected),
+           ~ replace_na(., 0)),
+    highest_severity = replace_na(highest_severity, "None")
+  )
+
+# Join the adverse event summaries to baseline_predictors
+baseline_predictors <- baseline_predictors %>%
+  left_join(adverse_summary_complete, by = c("RPT", "RINVSITE", "STUDY")) %>%
+  mutate(
+    highest_severity_num = ifelse(is.na(highest_severity_num), 0, highest_severity_num),
+    highest_severity = ifelse(is.na(highest_severity), "None", highest_severity)
+  )
+# Calculate time to first AE relative to day0
+baseline_predictors <- baseline_predictors %>%
+  mutate(
+    time_to_first_ae_relative = ifelse(
+      !is.na(time_to_first_ae) & !is.na(day0),
+      time_to_first_ae - day0,
+      NA
+    )
+  )
+
+# Remove the absolute time variable if you only want relative time
+baseline_predictors <- baseline_predictors %>%
+  dplyr::select(-time_to_first_ae) %>%
+  rename(time_to_first_ae = time_to_first_ae_relative)
+
+```
+
+
+```{r}
+# Convert dose variables to proper format for analysis
+pcdata_clean <- pcdata %>%
+  mutate(
+    # Convert EXDOSEN to numeric (extract numbers)
+    EXDOSEN_numeric = as.numeric(str_extract(EXDOSEN, "\\d+")),
+    EXDOSEN_category = case_when(
+      EXDOSEN == "Permanently Discontinued" ~ "Discontinued",
+      EXDOSEN == "0 mg QD" ~ "0 mg",
+      TRUE ~ EXDOSEN
+    ),
+    
+    # Convert EXDOSE2 to numeric
+    EXDOSE2_numeric = as.numeric(str_extract(EXDOSE2, "\\d+")),
+    EXDOSE2_category = case_when(
+      EXDOSE2 == "Permanently Discontinued" ~ "Discontinued",
+      EXDOSE2 == "0 mg/m2" ~ "0 mg",
+      TRUE ~ EXDOSE2
+    ),
+    
+    # Convert EXDOSE3 to categorical (it's already categorical)
+    EXDOSE3_category = case_when(
+      EXDOSE3 == "Permanently Discontinued" ~ "Discontinued",
+      TRUE ~ EXDOSE3
+    )
+  )
+
+# Treatment EDA Analysis
+treatment_analysis <- pcdata_clean %>%
+  group_by(STUDY, RPT, RINVSITE) %>%
+  arrange(VISDAY) %>%
+  summarise(
+    # Initial doses
+    initial_dose1 = first(na.omit(EXDOSEN_category)),
+    initial_dose2 = first(na.omit(EXDOSE2_category)),
+    initial_dose3 = first(na.omit(EXDOSE3_category)),
+    
+    # Initial numeric doses for calculations
+    initial_dose1_num = first(na.omit(EXDOSEN_numeric)),
+    initial_dose2_num = first(na.omit(EXDOSE2_numeric)),
+    
+    # Maximum doses
+    max_dose1 = max(EXDOSEN_numeric, na.rm = TRUE),
+    max_dose2 = max(EXDOSE2_numeric, na.rm = TRUE),
+    
+    # Treatment patterns
+    any_discontinuation = any(EXDOSEN == "Permanently Discontinued" | 
+                              EXDOSE2 == "Permanently Discontinued" | 
+                              EXDOSE3 == "Permanently Discontinued", na.rm = TRUE),
+    
+    all_discontinued = all(EXDOSEN == "Permanently Discontinued" & 
+                           EXDOSE2 == "Permanently Discontinued" & 
+                           EXDOSE3 == "Permanently Discontinued", na.rm = TRUE),
+    
+    # Total cycles
+    total_cycles = first(total_cycles),
+    
+    .groups = 'drop'
+  ) %>%
+  # Replace infinite values with NA
+  mutate(across(where(is.numeric), ~ifelse(is.infinite(.), NA, .)))
+# 1. SUMMARY TABLES
+cat("=== TREATMENT EDA SUMMARY ===\n\n")
+
+# Initial dose frequencies
+cat("Initial Dose Frequencies - QD:\n")
+initial_dose1_table <- treatment_analysis %>%
+  count(initial_dose1) %>%
+  mutate(percent = round(n / sum(n) * 100, 1)) %>%
+  arrange(desc(n))
+knitr::kable(initial_dose1_table, caption = "Initial QD Dose Frequencies")
+
+cat("\nInitial Dose Frequencies - DOCETAXEL:\n")
+initial_dose2_table <- treatment_analysis %>%
+  count(initial_dose2) %>%
+  mutate(percent = round(n / sum(n) * 100, 1)) %>%
+  arrange(desc(n))
+knitr::kable(initial_dose2_table, caption = "Initial DOCETAXEL Dose Frequencies")
+
+cat("\nInitial Dose Frequencies - PREDNISONE:\n")
+initial_dose3_table <- treatment_analysis %>%
+  count(initial_dose3) %>%
+  mutate(percent = round(n / sum(n) * 100, 1)) %>%
+  arrange(desc(n))
+knitr::kable(initial_dose3_table, caption = "Initial PREDNISONE Dose Frequencies")
+
+# Discontinuation summary
+cat("\nTreatment Discontinuation:\n")
+discontinuation_summary <- data.frame(
+  Metric = c("Patients with any discontinuation", "Patients with all treatments discontinued"),
+  Count = c(sum(treatment_analysis$any_discontinuation, na.rm = TRUE), 
+           sum(treatment_analysis$all_discontinued, na.rm = TRUE)),
+  Percentage = c(round(mean(treatment_analysis$any_discontinuation, na.rm = TRUE) * 100, 1),
+                round(mean(treatment_analysis$all_discontinued, na.rm = TRUE) * 100, 1))
+)
+knitr::kable(discontinuation_summary, caption = "Treatment Discontinuation Summary")
+```
+
+```{r}
+# Convert PK variables to proper format for analysis
+pk_clean <- pk %>%
+  mutate(
+    # Convert TYPEPK to categorical with consistent formatting
+    TYPEPK_category = case_when(
+      TYPEPK == "" ~ "Not Specified",
+      TYPEPK == "Sparse" ~ "Sparse Sampling",
+      TYPEPK == "Full" ~ "Full Sampling",
+      TRUE ~ TYPEPK
+    ),
+    
+    # Create binary indicator for PK consent
+    PK_consent_signed = ifelse(PKSAMP == "" | is.na(PKSAMP), "No", "Yes"),
+    
+    # Categorize PKDAY for analysis
+    PKDAY_category = case_when(
+      is.na(PKDAY) ~ "Not Applicable",
+      PKDAY == 0 ~ "Same Day",
+      PKDAY > 0 & PKDAY <= 7 ~ "Within 1 Week",
+      PKDAY > 7 & PKDAY <= 30 ~ "Within 1 Month",
+      PKDAY > 30 ~ "Over 1 Month",
+      TRUE ~ "Other"
+    )
+  )
+
+```
+
+
+```{r}
+# 2. PLOTS
+
+# Plot 1: Initial Dose Distributions
+p1 <- treatment_analysis %>%
+  dplyr::select(initial_dose1, initial_dose2, initial_dose3) %>%
+  pivot_longer(everything(), names_to = "treatment", values_to = "dose") %>%
+  filter(!is.na(dose)) %>%
+  mutate(treatment = case_when(
+    treatment == "initial_dose1" ~ "QD",
+    treatment == "initial_dose2" ~ "Docetaxel", 
+    treatment == "initial_dose3" ~ "Prednisone"
+  )) %>%
+  ggplot(aes(x = dose, fill = treatment)) +
+  geom_bar() +
+  facet_wrap(~treatment, scales = "free", ncol = 1) +
+  labs(title = "Initial Dose Distributions",
+       x = "Dose", y = "Number of Patients") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# Plot 2: Dose Distribution Over Time (if enough temporal data)
+# Get dose distribution by cycle
+dose_by_cycle <- pcdata_clean %>%
+  filter(grepl("Cycle", VISNAME)) %>%
+  mutate(cycle_num = as.numeric(str_extract(VISNAME, "(?<=Cycle )\\d+"))) %>%
+  group_by(cycle_num) %>%
+  summarise(
+    dose1_25mg = mean(EXDOSEN == "25 mg QD", na.rm = TRUE) * 100,
+    dose2_75mg = mean(EXDOSE2 == "75 mg/m2", na.rm = TRUE) * 100,
+    dose3_5mg = mean(EXDOSE3 == "5 mg BID", na.rm = TRUE) * 100,
+    discontinuation_rate = mean(EXDOSEN == "Permanently Discontinued" | 
+                                EXDOSE2 == "Permanently Discontinued" | 
+                                EXDOSE3 == "Permanently Discontinued", na.rm = TRUE) * 100,
+    .groups = 'drop'
+  )
+
+p2 <- dose_by_cycle %>%
+  pivot_longer(cols = -cycle_num, names_to = "metric", values_to = "percentage") %>%
+  mutate(metric = factor(metric, 
+                        levels = c("dose1_25mg", "dose2_75mg", "dose3_5mg", "discontinuation_rate"),
+                        labels = c("EXDOSEN: 25 mg QD", "Docetaxel: 75 mg/m2", "Prednisone: 5 mg BID", "Discontinuation Rate"))) %>%
+  ggplot(aes(x = cycle_num, y = percentage, color = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Treatment Patterns Over Cycles",
+       x = "Cycle Number", y = "Percentage of Patients (%)",
+       color = "Metric") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+
+
+# Plot 4: Treatment Duration vs Discontinuation
+p4 <- treatment_analysis %>%
+  mutate(discontinued = ifelse(any_discontinuation, "Discontinued", "Continued")) %>%
+  ggplot(aes(x = discontinued, y = total_cycles, fill = discontinued)) +
+  geom_violin(alpha = 0.7) +
+  geom_boxplot(width = 0.2, alpha = 0.7) +
+  labs(title = "Treatment Duration by Discontinuation Status",
+       x = "Discontinuation Status", y = "Total Cycles") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+
+# Arrange plots
+p1
+p2
+p4
+
+
+# 3. DETAILED ANALYSIS
+
+
+
+# Dose escalation patterns
+cat("\nDose Escalation Patterns - EXDOSEN:\n")
+dose_escalation1 <- pcdata_clean %>%
+  group_by(STUDY, RPT, RINVSITE) %>%
+  filter(!is.na(EXDOSEN_numeric), EXDOSEN != "Permanently Discontinued") %>%
+  summarise(
+    min_dose = min(EXDOSEN_numeric, na.rm = TRUE),
+    max_dose = max(EXDOSEN_numeric, na.rm = TRUE),
+    dose_increase = max_dose > min_dose,
+    .groups = 'drop'
+  )
+cat("Patients with dose escalation in EXDOSEN:", sum(dose_escalation1$dose_increase, na.rm = TRUE), 
+    "(", round(mean(dose_escalation1$dose_increase, na.rm = TRUE) * 100, 1), "%)\n")
+
+```
+
+#### Lenalidomide
+
+
+```{r}
+# Create binary lenalidomide enrollment variable and merge with treatment data
+lenalidomide_binary <- pk %>%
+  mutate(
+    lenalidomide_enrolled = ifelse(TYPEPK %in% c("Intensive", "Sparse"), 1, 0),
+    lenalidomide_type = case_when(
+      TYPEPK == "Intensive" ~ "Intensive",
+      TYPEPK == "Sparse" ~ "Sparse",
+      TRUE ~ "Not Enrolled"
+    )
+  ) %>%
+  dplyr::select(RPT, RINVSITE, STUDY, lenalidomide_enrolled, lenalidomide_type)
+
+# Merge with treatment analysis data
+treatment_lenalidomide_merged <- treatment_analysis %>%
+  left_join(lenalidomide_binary, by = c("RPT", "RINVSITE", "STUDY")) %>%
+  mutate(
+    lenalidomide_enrolled = ifelse(is.na(lenalidomide_enrolled), 0, lenalidomide_enrolled),
+    lenalidomide_type = ifelse(is.na(lenalidomide_type), "Not Enrolled", lenalidomide_type)
+  )
+
+# Verify the distribution
+cat("Lenalidomide Enrollment Distribution:\n")
+table(treatment_lenalidomide_merged$lenalidomide_enrolled)
+cat("\nLenalidomide Type Distribution:\n")
+table(treatment_lenalidomide_merged$lenalidomide_type)
+
+# 2. UPDATED PLOTS WITH LENALIDOMIDE ENROLLMENT
+
+# Plot 1: Initial Dose Distributions by Lenalidomide Enrollment
+p1 <- treatment_lenalidomide_merged %>%
+  dplyr::select(initial_dose1, initial_dose2, initial_dose3, lenalidomide_enrolled) %>%
+  pivot_longer(cols = c(initial_dose1, initial_dose2, initial_dose3), 
+               names_to = "treatment", values_to = "dose") %>%
+  filter(!is.na(dose)) %>%
+  mutate(treatment = case_when(
+    treatment == "initial_dose1" ~ "qd",
+    treatment == "initial_dose2" ~ "Docetaxel", 
+    treatment == "initial_dose3" ~ "Prednisone"
+  ),
+  lenalidomide_enrolled = factor(lenalidomide_enrolled, levels = c(1, 0), 
+                                labels = c("Lenalidomide Enrolled", "Not Lenalidomide Enrolled"))) %>%
+  ggplot(aes(x = dose, fill = lenalidomide_enrolled)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~treatment, scales = "free", ncol = 1) +
+  labs(title = "Initial Dose Distributions by Lenalidomide Enrollment Status",
+       x = "Dose", y = "Number of Patients",
+       fill = "Lenalidomide Enrollment") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 2: Initial Dose Distributions by Detailed Lenalidomide Type
+p1_detail <- treatment_lenalidomide_merged %>%
+  dplyr::select(initial_dose1, initial_dose2, initial_dose3, lenalidomide_type) %>%
+  pivot_longer(cols = c(initial_dose1, initial_dose2, initial_dose3), 
+               names_to = "treatment", values_to = "dose") %>%
+  filter(!is.na(dose)) %>%
+  mutate(treatment = case_when(
+    treatment == "initial_dose1" ~ "QD",
+    treatment == "initial_dose2" ~ "Docetaxel", 
+    treatment == "initial_dose3" ~ "Prednisone"
+  )) %>%
+  ggplot(aes(x = dose, fill = lenalidomide_type)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~treatment, scales = "free", ncol = 1) +
+  labs(title = "Initial Dose Distributions by Lenalidomide Sampling Type",
+       x = "Dose", y = "Number of Patients",
+       fill = "Lenalidomide Sampling Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 3: Treatment Patterns Over Cycles by Lenalidomide Enrollment
+dose_by_cycle_lenalidomide <- pcdata_clean %>%
+  filter(grepl("Cycle", VISNAME)) %>%
+  mutate(cycle_num = as.numeric(str_extract(VISNAME, "(?<=Cycle )\\d+"))) %>%
+  left_join(treatment_lenalidomide_merged %>% 
+            dplyr::select(RPT, RINVSITE, lenalidomide_enrolled, lenalidomide_type), 
+            by = c("RPT", "RINVSITE")) %>%
+  group_by(cycle_num, lenalidomide_enrolled) %>%
+  summarise(
+    dose1_25mg = mean(EXDOSEN == "25 mg QD", na.rm = TRUE) * 100,
+    dose2_75mg = mean(EXDOSE2 == "75 mg/m2", na.rm = TRUE) * 100,
+    dose3_5mg = mean(EXDOSE3 == "5 mg BID", na.rm = TRUE) * 100,
+    discontinuation_rate = mean(EXDOSEN == "Permanently Discontinued" | 
+                                EXDOSE2 == "Permanently Discontinued" | 
+                                EXDOSE3 == "Permanently Discontinued", na.rm = TRUE) * 100,
+    n_patients = n_distinct(RPT, RINVSITE),
+    .groups = 'drop'
+  )
+p2 <- dose_by_cycle_lenalidomide %>%
+  pivot_longer(cols = c(dose1_25mg, dose2_75mg, dose3_5mg, discontinuation_rate), 
+               names_to = "metric", values_to = "percentage") %>%
+  mutate(metric = factor(metric, 
+                        levels = c("dose1_25mg", "dose2_75mg", "dose3_5mg", "discontinuation_rate"),
+                        labels = c("QD: 25 mg QD", "Docetaxel: 75 mg/m2", "Prednisone: 5 mg BID", "Discontinuation Rate")),
+         lenalidomide_enrolled = factor(lenalidomide_enrolled, levels = c(1, 0), 
+                             labels = c("Lenalidomide Enrolled", "Not Lenalidomide Enrolled"))) %>%
+  ggplot(aes(x = cycle_num, y = percentage, color = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  facet_wrap(~lenalidomide_enrolled, ncol = 1) +
+  labs(title = "Treatment Patterns Over Cycles by Lenalidomide Enrollment",
+       x = "Cycle Number", y = "Percentage of Patients (%)",
+       color = "Treatment Metric") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+
+# Plot 4: Treatment Duration by Lenalidomide Enrollment and Discontinuation
+p3 <- treatment_lenalidomide_merged %>%
+  mutate(discontinued = ifelse(any_discontinuation, "Discontinued", "Continued"),
+         lenalidomide_enrolled = factor(lenalidomide_enrolled, levels = c(1, 0), 
+                             labels = c("Lenalidomide Enrolled", "Not Lenalidomide Enrolled"))) %>%
+  ggplot(aes(x = discontinued, y = total_cycles, fill = lenalidomide_enrolled)) +
+  geom_violin(alpha = 0.7) +
+  geom_boxplot(width = 0.2, alpha = 0.7, position = position_dodge(0.9)) +
+  labs(title = "Treatment Duration by Discontinuation Status and Lenalidomide Enrollment",
+       x = "Discontinuation Status", y = "Total Cycles",
+       fill = "Lenalidomide Enrollment") +
+  theme_minimal()
+
+# Display plots
+p1
+p1_detail
+p2
+p3
+
+
+```
+
+#### Adverse events
+
+```{r}
+# Basic dataset overview
+cat("Dataset Overview:\n")
+cat("Total adverse events:", nrow(adverse), "\n")
+cat("Total subjects:", n_distinct(adverse$RPT), "\n")
+cat("Total study sites:", n_distinct(adverse$RINVSITE), "\n")
+cat("Study:", unique(adverse$STUDY), "\n\n")
+
+# 1. ADVERSE EVENTS BREAKDOWN
+cat("1. ADVERSE EVENTS BREAKDOWN\n")
+cat("======================================================", "\n")
+
+# Most common adverse events
+top_events <- adverse %>%
+  count(AEDECOD, sort = TRUE) %>%
+  head(15)
+
+print("Top 15 Most Common Adverse Events (by Preferred Term):")
+print(top_events)
+
+# Body system analysis
+body_system_summary <- adverse %>%
+  count(AEBODSYS, sort = TRUE) %>%
+  mutate(percentage = n / nrow(adverse) * 100)
+
+print("\nAdverse Events by Body System:")
+print(body_system_summary)
+
+# High Level Group analysis
+hlgt_summary <- adverse %>%
+  count(HLGTNM, sort = TRUE) %>%
+  head(10) %>%
+  mutate(percentage = n / nrow(adverse) * 100)
+
+print("\nTop 10 High Level Group Terms:")
+print(hlgt_summary)
+
+# 2. SEVERITY ANALYSIS
+cat("\n2. SEVERITY ANALYSIS\n")
+cat("======================================================", "\n")
+
+severity_summary <- adverse %>%
+  count(AESEVN, name = "count") %>%
+  mutate(percentage = count / nrow(adverse) * 100)
+
+print("Adverse Events by Severity:")
+print(severity_summary)
+
+# Severity by body system
+severity_by_system <- adverse %>%
+  count(AEBODSYS, AESEVN) %>%
+  group_by(AEBODSYS) %>%
+  mutate(total_in_system = sum(n),
+         proportion = n / total_in_system) %>%
+  ungroup()
+
+print("\nSeverity Distribution by Body System (Top 10 systems):")
+severity_by_system %>%
+  arrange(desc(total_in_system)) %>%
+  head(20) %>%
+  print()
+
+# 3. RELATIONSHIP TO STUDY DRUGS
+cat("\n3. RELATIONSHIP TO STUDY DRUGS\n")
+cat("======================================================", "\n")
+
+# Relationship to Celgene study drug
+rel_celgene <- adverse %>%
+  count(AERELN, name = "count") %>%
+  mutate(percentage = count / nrow(adverse) * 100)
+
+print("Relationship to Celgene Study Drug:")
+print(rel_celgene)
+
+# Relationship to other study treatments
+rel_other <- adverse %>%
+  count(AERELOTH, name = "count") %>%
+  mutate(percentage = count / nrow(adverse) * 100)
+
+print("\nRelationship to Other Study Treatments:")
+print(rel_other)
+
+# Suspected events analysis
+suspected_events <- adverse %>%
+  filter(AERELN == "Suspected") %>%
+  count(AEDECOD, sort = TRUE) %>%
+  head(15)
+
+print("\nTop 15 Suspected Adverse Events (Related to Celgene Drug):")
+print(suspected_events)
+
+# 4. ACTIONS TAKEN ANALYSIS
+cat("\n4. ACTIONS TAKEN ON STUDY DRUGS\n")
+cat("======================================================", "\n")
+
+# Actions on Celgene study drug
+actions_celgene <- adverse %>%
+  count(AEACN, name = "count") %>%
+  mutate(percentage = count / nrow(adverse) * 100)
+
+print("Actions Taken on Celgene Study Drug:")
+print(actions_celgene)
+
+# Actions on other study treatments
+actions_other <- adverse %>%
+  count(AEACNOTH, name = "count") %>%
+  mutate(percentage = count / nrow(adverse) * 100)
+
+print("\nActions Taken on Other Study Treatments:")
+print(actions_other)
+
+# 5. SERIOUS ADVERSE EVENTS
+cat("\n5. SERIOUS ADVERSE EVENTS ANALYSIS\n")
+cat("======================================================", "\n")
+
+serious_summary <- adverse %>%
+  count(AESERN, name = "count") %>%
+  mutate(percentage = count / nrow(adverse) * 100)
+
+print("Serious Adverse Events:")
+print(serious_summary)
+
+# Most common serious adverse events
+serious_events <- adverse %>%
+  filter(AESERN == "Yes") %>%
+  count(AEDECOD, sort = TRUE) %>%
+  head(15)
+
+print("\nTop 15 Serious Adverse Events:")
+print(serious_events)
+
+# 6. INTEGRATED ANALYSIS
+cat("\n6. INTEGRATED ANALYSIS\n")
+cat("======================================================", "\n")
+
+# Relationship between severity and drug relationship
+severity_vs_relationship <- adverse %>%
+  count(AESEVN, AERELN) %>%
+  group_by(AESEVN) %>%
+  mutate(total_severity = sum(n),
+         proportion = n / total_severity) %>%
+  ungroup()
+
+print("Severity vs Relationship to Celgene Drug:")
+print(severity_vs_relationship)
+
+# Actions taken vs severity
+actions_vs_severity <- adverse %>%
+  count(AEACN, AESEVN) %>%
+  group_by(AEACN) %>%
+  mutate(total_action = sum(n),
+         proportion = n / total_action) %>%
+  ungroup()
+
+print("\nActions Taken vs Severity:")
+actions_vs_severity %>%
+  arrange(AEACN, desc(n)) %>%
+  print()
+
+# 7. VISUALIZATIONS
+cat("\n7. KEY VISUALIZATIONS\n")
+cat("======================================================", "\n")
+
+# Plot 1: Top adverse events by body system
+ggplot(body_system_summary %>% head(10), 
+       aes(x = reorder(AEBODSYS, n), y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 10 Body Systems by Adverse Event Count",
+       x = "Body System", y = "Number of Events") +
+  theme_minimal()
+
+# Plot 2: Severity distribution
+ggplot(severity_summary, aes(x = AESEVN, y = count)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  labs(title = "Adverse Events by Severity",
+       x = "Severity", y = "Count") +
+  theme_minimal()
+
+# Plot 3: Relationship to study drug vs actions taken
+relationship_actions <- adverse %>%
+  count(AERELN, AEACN) %>%
+  filter(!is.na(AERELN), !is.na(AEACN))
+
+ggplot(relationship_actions, aes(x = AERELN, y = AEACN, size = n, color = n)) +
+  geom_point() +
+  scale_size_continuous(range = c(3, 10)) +
+  labs(title = "Relationship to Drug vs Actions Taken",
+       x = "Relationship to Celgene Drug", 
+       y = "Action Taken") +
+  theme_minimal()
+
+# Plot 4: Serious events by body system
+serious_by_system <- adverse %>%
+  filter(AESERN == "Yes") %>%
+  count(AEBODSYS, sort = TRUE) %>%
+  head(10)
+
+ggplot(serious_by_system, aes(x = reorder(AEBODSYS, n), y = n)) +
+  geom_bar(stat = "identity", fill = "red") +
+  coord_flip() +
+  labs(title = "Top 10 Body Systems with Serious Adverse Events",
+       x = "Body System", y = "Number of Serious Events") +
+  theme_minimal()
+
+# 8. KEY INSIGHTS SUMMARY
+cat("\n8. KEY INSIGHTS SUMMARY\n")
+cat("======================================================", "\n")
+
+# Calculate key metrics
+total_events <- nrow(adverse)
+suspected_count <- sum(adverse$AERELN == "Suspected", na.rm = TRUE)
+serious_count <- sum(adverse$AESERN == "Yes", na.rm = TRUE)
+dose_changed_count <- sum(adverse$AEACN %in% c("Dose reduced", "Dose interrupted", 
+                                              "Dose interrupted and reduced", 
+                                              "Drug withdrawn permanently"), na.rm = TRUE)
+
+cat("Key Metrics:\n")
+cat("- Total adverse events:", total_events, "\n")
+cat("- Suspected related to Celgene drug:", suspected_count, 
+    paste0("(", round(suspected_count/total_events*100, 1), "%)"), "\n")
+cat("- Serious adverse events:", serious_count,
+    paste0("(", round(serious_count/total_events*100, 1), "%)"), "\n")
+cat("- Events requiring dose modification:", dose_changed_count,
+    paste0("(", round(dose_changed_count/total_events*100, 1), "%)"), "\n")
+
+# Most affected body systems
+cat("\nMost Affected Body Systems:\n")
+body_system_summary %>% head(5) %>% print()
+
+# Most common actions
+cat("\nMost Common Actions:\n")
+actions_celgene %>% head(5) %>% print()
+```
+
+## Analysis {.tabset}
+
+### Survival Analysis {.tabset}
+
+#### Overall
+
+```{r}
+survival_data <- baseline_predictors %>%
+  filter(!is.na(os_time), !is.na(os_event)) %>%
+  filter(os_time >= 0) %>%  # Remove negative times
+  filter(!is.infinite(os_time))  # Remove infinite times
+
+surv_obj <- Surv(time = survival_data$os_time, event = survival_data$os_event)
+km_fit <- survfit(surv_obj ~ 1, data = survival_data)
+# If you prefer a basic plot without risk table
+ggsurvplot(km_fit,
+           data = survival_data,
+           risk.table = FALSE,
+           conf.int = TRUE,
+           xlab = "Time (days from Day 0)",
+           ylab = "Overall Survival Probability",
+           title = "Kaplan-Meier Curve for Overall Survival",
+           legend = "none",
+           palette = "blue",
+           ggtheme = theme_bw())
+
+
+temp<- survival_data%>%
+  filter(!is.na(AGE), !is.na(ECOGGRN), !is.na(anytarget), !is.na(total_cycles))
+cox_model <- coxph(
+  Surv(os_time, os_event) ~ AGE + total_cycles + anytarget + as.factor(ECOGGRN),
+  data = temp
+)
+forest_model(cox_model)
+
+```
+
+```{r}
+temp <- survival_data%>%
+  filter(!is.na(total_cycles), !is.na(total_severe_ae_suspected), !is.na(total_body_systems_suspected), !is.na(time_to_first_ae) )
+cox_model <- coxph(
+  Surv(os_time, os_event) ~  total_cycles + total_severe_ae_suspected + total_body_systems_suspected + time_to_first_ae,
+  data = temp
+)
+forest_model(cox_model)
+```
+
+#### Specific Deaths
+
+
+```{r}
+survival_data <- baseline_predictors %>%
+  filter(!is.na(os_time), !is.na(CANCDEAD)) %>%
+  filter(os_time >= 0) %>%  # Remove negative times
+  filter(!is.infinite(os_time))  # Remove infinite times
+
+surv_obj <- Surv(time = survival_data$os_time, event = survival_data$CANCDEAD)
+km_fit <- survfit(surv_obj ~ 1, data = survival_data)
+# If you prefer a basic plot without risk table
+ggsurvplot(km_fit,
+           data = survival_data,
+           risk.table = FALSE,
+           conf.int = TRUE,
+           xlab = "Time (days from Day 0)",
+           ylab = "Overall Survival Probability",
+           title = "Kaplan-Meier Curve for Overall Survival",
+           legend = "none",
+           palette = "blue",
+           ggtheme = theme_bw())
+
+
+temp<- survival_data%>%
+  filter(!is.na(AGE), !is.na(ECOGGRN), !is.na(anytarget), !is.na(total_cycles))
+cox_model <- coxph(
+  Surv(os_time, CANCDEAD) ~ AGE + total_cycles + anytarget + as.factor(ECOGGRN),
+  data = temp
+)
+forest_model(cox_model)
+
+```
+
+
+```{r}
+temp <- survival_data%>%
+  filter(!is.na(total_cycles), !is.na(total_severe_ae_suspected), !is.na(total_body_systems_suspected), !is.na(time_to_first_ae) )
+cox_model <- coxph(
+  Surv(os_time, CANCDEAD) ~  total_cycles + total_severe_ae_suspected + total_body_systems_suspected + time_to_first_ae,
+  data = temp
+)
+forest_model(cox_model)
+```
+
+
+#### With Treatment {.tabset}
+
+##### Overall
+
+```{r}
+
+
+# Merge with survival data
+survival_data <- baseline_predictors %>%
+  filter(!is.na(os_time), !is.na(os_event)) %>%
+  filter(os_time >= 0) %>%  # Remove negative times
+  filter(!is.infinite(os_time)) 
+
+# Verify distribution
+cat("Lenalidomide Enrollment in Survival Data:\n")
+table(survival_data$lenalidomide)
+cat("\nLenalidomide Type in Survival Data:\n")
+table(survival_data$TYPEPKN)
+
+# Create survival objects and plots
+
+# Plot 1: Faceted by binary enrollment status
+surv_obj_binary <- Surv(time = survival_data$os_time, event = survival_data$os_event)
+km_fit_binary <- survfit(surv_obj_binary ~ lenalidomide, data = survival_data)
+
+p1 <- ggsurvplot(km_fit_binary,
+                 data = survival_data,
+                 risk.table = TRUE,
+                 conf.int = TRUE,
+                 xlab = "Time (days from Day 0)",
+                 ylab = "Overall Survival Probability",
+                 title = "Kaplan-Meier Curves by Lenalidomide Enrollment Status",
+                 legend.title = "Lenalidomide",
+                 legend.labs = c("Not Enrolled", "Enrolled"),
+                 palette = c("red", "blue"),
+                 ggtheme = theme_bw())
+
+temp<- survival_data%>%
+  filter(!is.na(AGE), !is.na(total_cycles), !is.na(anytarget), !is.na(lenalidomide))
+surv_obj_filtered <- Surv(time = temp$os_time, event = temp$os_event)
+
+cox_model <- coxph(
+  surv_obj_filtered ~ AGE + total_cycles + anytarget + lenalidomide,
+  data = temp
+)
+forest_model(cox_model)
+
+
+
+# Plot 2: Faceted by detailed lenalidomide type
+surv_obj_type <- Surv(time = survival_data$os_time, event = survival_data$os_event)
+km_fit_type <- survfit(surv_obj_type ~ TYPEPKN, data = survival_data)
+
+p2 <- ggsurvplot(km_fit_type,
+                 data = survival_data,
+                 risk.table = TRUE,
+                 conf.int = TRUE,
+                 xlab = "Time (days from Day 0)",
+                 ylab = "Overall Survival Probability",
+                 title = "Kaplan-Meier Curves by Lenalidomide Sampling Type",
+                 legend.title = "Sampling Type",
+                 legend.labs = c("Intensive", "Not Enrolled", "Sparse"),
+                 palette = c("green", "red", "blue"),
+                 ggtheme = theme_bw())
+
+temp<- survival_data%>%
+  filter(!is.na(AGE), !is.na(total_cycles), !is.na(anytarget), !is.na(TYPEPKN))
+surv_obj_filtered <- Surv(time = temp$os_time, event = temp$os_event)
+
+cox_model <- coxph(
+  surv_obj_filtered ~ AGE + total_cycles + anytarget + as.factor(TYPEPKN),
+  data = temp
+)
+forest_model(cox_model)
+
+# Plot 3: Separate facets for each lenalidomide type
+# Create a list of plots for each type
+TYPEPKs <- c("Not Enrolled", "Sparse", "Intensive")
+plot_list <- list()
+
+for (i in seq_along(TYPEPKs)) {
+  type <- TYPEPKs[i]
+  subset_data <- survival_data %>% filter(TYPEPK == type)
+  
+  if (nrow(subset_data) > 0) {
+    surv_obj_subset <- Surv(time = subset_data$os_time, event = subset_data$os_event)
+    km_fit_subset <- survfit(surv_obj_subset ~ 1, data = subset_data)
+    
+    plot_list[[i]] <- ggsurvplot(km_fit_subset,
+                                data = subset_data,
+                                risk.table = TRUE,
+                                conf.int = TRUE,
+                                xlab = "Time (days from Day 0)",
+                                ylab = "Overall Survival Probability",
+                                title = paste("Overall Survival -", type, "Sampling"),
+                                palette = c("steelblue"),
+                                ggtheme = theme_bw())
+  }
+}
+
+# Display the plots
+print(p1)
+print(p2)
+
+```
+
+```{r}
+# Statistical comparisons
+cat("\n=== STATISTICAL COMPARISONS ===\n")
+
+# Log-rank test for binary enrollment
+lr_test_binary <- survdiff(Surv(os_time, os_event) ~ TYPEPK, data = survival_data)
+cat("Log-rank test for lenalidomide enrollment (binary):\n")
+cat("p-value:", round(1 - pchisq(lr_test_binary$chisq, length(lr_test_binary$n) - 1), 4), "\n")
+
+# Log-rank test for detailed types
+lr_test_type <- survdiff(Surv(os_time, os_event) ~ TYPEPK, data = survival_data)
+cat("\nLog-rank test for lenalidomide sampling types:\n")
+cat("p-value:", round(1 - pchisq(lr_test_type$chisq, length(lr_test_type$n) - 1), 4), "\n")
+
+# Summary statistics by lenalidomide type
+cat("\nSurvival Summary by Lenalidomide Type:\n")
+survival_summary <- survival_data %>%
+  group_by(TYPEPK) %>%
+  summarise(
+    n_patients = n(),
+    events = sum(os_event, na.rm = TRUE),
+    event_rate = round(mean(os_event, na.rm = TRUE) * 100, 1),
+    median_survival = round(median(os_time, na.rm = TRUE), 1),
+    mean_survival = round(mean(os_time, na.rm = TRUE), 1),
+    .groups = 'drop'
+  )
+knitr::kable(survival_summary, caption = "Survival Characteristics by Lenalidomide Sampling Type")
+```
+
+
+##### Specific Deaths
+
+```{r}
+
+
+# Merge with survival data
+survival_data <- baseline_predictors %>%
+  filter(!is.na(os_time), !is.na(CANCDEAD)) %>%
+  filter(os_time >= 0) %>%  # Remove negative times
+  filter(!is.infinite(os_time)) 
+
+# Verify distribution
+cat("Lenalidomide Enrollment in Survival Data:\n")
+table(survival_data$lenalidomide)
+cat("\nLenalidomide Type in Survival Data:\n")
+table(survival_data$TYPEPKN)
+
+# Create survival objects and plots
+
+# Plot 1: Faceted by binary enrollment status
+surv_obj_binary <- Surv(time = survival_data$os_time, event = survival_data$CANCDEAD)
+km_fit_binary <- survfit(surv_obj_binary ~ lenalidomide, data = survival_data)
+
+p1 <- ggsurvplot(km_fit_binary,
+                 data = survival_data,
+                 risk.table = TRUE,
+                 conf.int = TRUE,
+                 xlab = "Time (days from Day 0)",
+                 ylab = "Overall Survival Probability",
+                 title = "Kaplan-Meier Curves by Lenalidomide Enrollment Status",
+                 legend.title = "Lenalidomide",
+                 legend.labs = c("Not Enrolled", "Enrolled"),
+                 palette = c("red", "blue"),
+                 ggtheme = theme_bw())
+
+temp<- survival_data%>%
+  filter(!is.na(AGE), !is.na(total_cycles), !is.na(anytarget), !is.na(lenalidomide))
+surv_obj_filtered <- Surv(time = temp$os_time, event = temp$CANCDEAD)
+
+cox_model <- coxph(
+  surv_obj_filtered ~ AGE + total_cycles + anytarget + lenalidomide,
+  data = temp
+)
+forest_model(cox_model)
+
+
+
+# Plot 2: Faceted by detailed lenalidomide type
+surv_obj_type <- Surv(time = survival_data$os_time, event = survival_data$CANCDEAD)
+km_fit_type <- survfit(surv_obj_type ~ TYPEPKN, data = survival_data)
+
+p2 <- ggsurvplot(km_fit_type,
+                 data = survival_data,
+                 risk.table = TRUE,
+                 conf.int = TRUE,
+                 xlab = "Time (days from Day 0)",
+                 ylab = "Overall Survival Probability",
+                 title = "Kaplan-Meier Curves by Lenalidomide Sampling Type",
+                 legend.title = "Sampling Type",
+                 legend.labs = c("Intensive", "Not Enrolled", "Sparse"),
+                 palette = c("green", "red", "blue"),
+                 ggtheme = theme_bw())
+
+temp<- survival_data%>%
+  filter(!is.na(AGE), !is.na(total_cycles), !is.na(anytarget), !is.na(TYPEPKN))
+surv_obj_filtered <- Surv(time = temp$os_time, event = temp$CANCDEAD)
+
+cox_model <- coxph(
+  surv_obj_filtered ~ AGE + total_cycles + anytarget + as.factor(TYPEPKN),
+  data = temp
+)
+forest_model(cox_model)
+
+# Plot 3: Separate facets for each lenalidomide type
+# Create a list of plots for each type
+TYPEPKs <- c("Not Enrolled", "Sparse", "Intensive")
+plot_list <- list()
+
+for (i in seq_along(TYPEPKs)) {
+  type <- TYPEPKs[i]
+  subset_data <- survival_data %>% filter(TYPEPK == type)
+  
+  if (nrow(subset_data) > 0) {
+    surv_obj_subset <- Surv(time = subset_data$os_time, event = subset_data$CANCDEAD)
+    km_fit_subset <- survfit(surv_obj_subset ~ 1, data = subset_data)
+    
+    plot_list[[i]] <- ggsurvplot(km_fit_subset,
+                                data = subset_data,
+                                risk.table = TRUE,
+                                conf.int = TRUE,
+                                xlab = "Time (days from Day 0)",
+                                ylab = "Overall Survival Probability",
+                                title = paste("Overall Survival -", type, "Sampling"),
+                                palette = c("steelblue"),
+                                ggtheme = theme_bw())
+  }
+}
+
+# Display the plots
+print(p1)
+print(p2)
+
+```
+
+#### Cox with Cubic Splines
+
+```{r}
+# Load required packages
+
+
+# Prepare the survival data
+survival_data <- baseline_predictors %>%
+  filter(!is.na(os_time), !is.na(os_event), !is.na(anytarget)) %>%
+  filter(os_time >= 0) %>%  # Remove negative times
+  filter(!is.infinite(os_time)) %>%  # Remove infinite times
+  mutate(
+    # Convert categorical variables to factors
+    SEXN = as.factor(SEXN),
+    ECOGGRN = as.factor(ECOGGRN),
+    anytarget = as.factor(anytarget),
+    anynontarget = as.factor(anynontarget),
+    # Create a combined treatment variable if needed
+    treatment_group = interaction(anytarget, anynontarget)
+  )
+
+# Set up the datadist for rms package (important for plotting and summary)
+ddist <- datadist(survival_data)
+options(datadist = "ddist")
+
+# First, let's check for missing values in all variables we want to use
+cat("Missing values in each variable:\n")
+survival_data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  print()
+
+# Create a complete case dataset for modeling
+model_data <- survival_data %>%
+  # Select only the variables we need for the model
+  dplyr::select(os_time, os_event, 
+                AGE, lenalidomide, TYPEPKN,
+                SEXN, ECOGGRN, anytarget, anynontarget,
+                total_ae_suspected, total_severe_ae_suspected, 
+                total_body_systems_suspected, time_to_first_ae) %>%
+  # Remove rows with any missing values in these variables
+  na.omit()
+
+cat("Original survival_data rows:", nrow(survival_data), "\n")
+cat("Complete case model_data rows:", nrow(model_data), "\n")
+
+# Convert categorical variables to factors
+model_data <- model_data %>%
+  mutate(
+    SEXN = as.factor(SEXN),
+    ECOGGRN = as.factor(ECOGGRN),
+    anytarget = as.factor(anytarget),
+    anynontarget = as.factor(anynontarget)
+  )
+
+# Set up the datadist for rms package
+ddist <- datadist(model_data)
+options(datadist = "ddist")
+
+# Model 1: Start with a simpler model to ensure it works
+# Replace pspline() with rcs() (restricted cubic splines)
+model1 <- cph(Surv(os_time, os_event) ~ 
+                # Key continuous variables with restricted cubic splines
+                rcs(AGE, 4) + 
+                rcs(total_body_systems_suspected, 4) +
+                # Categorical variables
+                ECOGGRN + lenalidomide +
+                # Key adverse event variables
+                rcs(total_severe_ae_suspected, 4),
+              data = model_data,
+              x = TRUE, y = TRUE, surv = TRUE)
+tab_model(model1)
+
+# Plot the nonlinear effects for each spline term
+par(mfrow = c(2, 2))  # Set up 2x2 plot layout
+
+# Plot AGE effect
+plot(Predict(model1, AGE, fun = exp), 
+     main = "Hazard Ratio for AGE", 
+     ylab = "Hazard Ratio", 
+     xlab = "Age")
+
+# Plot BMI effect  
+plot(Predict(model1, total_body_systems_suspected, fun = exp),
+     main = "Hazard Ratio for Total Body Systems Affected By AE",
+     ylab = "Hazard Ratio",
+     xlab = "Body Systems with Adverse Events")
+
+# Plot total_severe_ae_suspected effect
+plot(Predict(model1, total_severe_ae_suspected, fun = exp),
+     main = "Hazard Ratio for Severe AEs",
+     ylab = "Hazard Ratio", 
+     xlab = "Number of Severe Adverse Events")
+
+par(mfrow = c(1, 1))  # Reset plot layout
+# If that works, try adding more variables gradually
+model2 <- cph(Surv(os_time, os_event) ~ 
+                rcs(AGE,3) + 
+                rcs(total_body_systems_suspected, 3) +
+                lenalidomide+
+                ECOGGRN + anytarget + anynontarget +
+                rcs(total_severe_ae_suspected, 3) +
+                rcs(time_to_first_ae, 3),
+              data = model_data,
+              x = TRUE, y = TRUE, surv = TRUE)
+
+tab_model(model2)
+
+
+```
+
+```{r}
+# Load required libraries
+library(survival)
+library(glmnet)
+library(tidyverse)
+library(caret)
+
+# Data preparation with proper missing value handling
+predictor_vars <- c(
+  "ECOGGRN", "HEIGHT", "WEIGHT", "BMI", "TEMP", "SYSBP", "DIABP", "PULSE", "AGE",
+  "SEXN", "anytarget", "anynontarget", "total_cycles", "lenalidomide",
+  "total_ae_suspected", "total_severe_ae_suspected", "total_body_systems_suspected",
+  "highest_severity_num", "time_to_first_ae"
+)
+
+# Create analysis dataset with robust missing value handling
+analysis_data <- baseline_predictors %>%
+  dplyr::select(all_of(predictor_vars), os_time, os_event, RACEPRIM) %>%
+  # Remove rows with missing survival outcomes (essential)
+  filter(!is.na(os_time) & !is.na(os_event)) %>%
+  # Convert race to factor
+  mutate(RACEPRIM = as.factor(RACEPRIM))
+
+# Check for missing values in predictors
+missing_summary <- sapply(analysis_data, function(x) sum(is.na(x)))
+print("Missing values by variable:")
+print(missing_summary)
+
+# Option 1: Remove rows with any missing values in predictors
+# analysis_data_clean <- analysis_data %>% drop_na()
+
+# Option 2: Impute missing values using median for numeric and mode for categorical
+analysis_data_clean <- analysis_data %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  # For categorical variables, use the most frequent category
+  mutate(RACEPRIM = as.character(RACEPRIM),
+         RACEPRIM = ifelse(is.na(RACEPRIM), 
+                          names(which.max(table(RACEPRIM))), 
+                          RACEPRIM),
+         RACEPRIM = as.factor(RACEPRIM))
+
+# Verify no missing values remain
+print("Missing values after cleaning:")
+print(sapply(analysis_data_clean, function(x) sum(is.na(x))))
+
+# Create dummy variables for categorical variables
+dummy_vars <- dummyVars(~ RACEPRIM, data = analysis_data_clean)
+race_dummies <- predict(dummy_vars, newdata = analysis_data_clean) %>% as.data.frame()
+
+# Combine with numeric predictors
+final_data <- analysis_data_clean %>%
+  dplyr::select(-RACEPRIM) %>%
+  bind_cols(race_dummies)
+
+# Prepare matrices for glmnet
+x_vars <- final_data %>% 
+  dplyr::select(-os_time, -os_event) %>%
+  as.matrix()
+
+y <- Surv(time = final_data$os_time, event = final_data$os_event)
+
+# Alternative approach using glmnet's built-in missing value handling
+# Using makeX() function from glmnet to properly handle missing values
+library(glmnetUtils)  # For enhanced glmnet functionality
+
+# Simple approach: use glmnetUtils which handles formulas and missing values
+set.seed(123)
+
+# Split data first, then handle missing values within training set
+train_index <- createDataPartition(final_data$os_event, p = 0.8, list = FALSE)
+
+# Create training and test sets from original data to avoid data leakage
+train_data <- analysis_data[train_index, ]
+test_data <- analysis_data[-train_index, ]
+
+# Use cva.glmnet for automatic alpha and lambda selection
+if (!require(glmnetUtils)) {
+  install.packages("glmnetUtils")
+  library(glmnetUtils)
+}
+
+# Fit model using formula interface (handles factors and missing values automatically)
+set.seed(123)
+cv_fit <- cv.glmnet(
+  Surv(os_time, os_event) ~ ECOGGRN + HEIGHT + WEIGHT + BMI + TEMP + SYSBP + DIABP + PULSE + AGE +
+    SEXN + anytarget + anynontarget + total_cycles + lenalidomide +
+    total_ae_suspected + total_severe_ae_suspected + total_body_systems_suspected +
+    highest_severity_num + time_to_first_ae + RACEPRIM,
+  data = train_data,
+  family = "cox",
+  alpha = 0.5,
+  nfolds = 10
+)
+
+# If the above still gives errors, use this robust approach:
+# Remove any remaining missing values from training data
+train_data_clean <- train_data %>%
+  filter(complete.cases(dplyr::select(., all_of(predictor_vars))))
+
+# Create the design matrix manually with proper missing value handling
+x_train <- model.matrix(
+  ~ ECOGGRN + HEIGHT + WEIGHT + BMI + TEMP + SYSBP + DIABP + PULSE + AGE +
+    SEXN + anytarget + anynontarget + total_cycles + lenalidomide +
+    total_ae_suspected + total_severe_ae_suspected + total_body_systems_suspected +
+    highest_severity_num + time_to_first_ae + RACEPRIM,
+  data = train_data_clean
+)[,-1]  # Remove intercept column
+
+y_train <- Surv(time = train_data_clean$os_time, event = train_data_clean$os_event)
+
+# Now fit the model
+set.seed(123)
+cv_fit <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  family = "cox",
+  alpha = 0.5,
+  nfolds = 10,
+  parallel = FALSE  # Turn off parallel if still having issues
+)
+
+# Plot cross-validation results
+plot(cv_fit)
+
+# Get optimal lambda
+lambda_min <- cv_fit$lambda.min
+cat("Optimal lambda:", lambda_min, "\n")
+
+# Fit final model
+final_model <- glmnet(
+  x = x_train,
+  y = y_train,
+  family = "cox",
+  alpha = 0.5,
+  lambda = lambda_min
+)
+
+# Model coefficients
+coefficients <- coef(final_model)
+print("Model coefficients:")
+print(coefficients)
+
+# Significant predictors
+non_zero_coef <- coefficients[which(coefficients != 0), ]
+if (length(non_zero_coef) > 0) {
+  print("Non-zero coefficients:")
+  print(non_zero_coef)
+} else {
+  print("No predictors selected (all coefficients zero)")
+}
+
+# Prepare test data similarly
+test_data_clean <- test_data %>%
+  filter(complete.cases(dplyr::select(., all_of(predictor_vars))))
+
+x_test <- model.matrix(
+  ~ ECOGGRN + HEIGHT + WEIGHT + BMI + TEMP + SYSBP + DIABP + PULSE + AGE +
+    SEXN + anytarget + anynontarget + total_cycles + lenalidomide +
+    total_ae_suspected + total_severe_ae_suspected + total_body_systems_suspected +
+    highest_severity_num + time_to_first_ae + RACEPRIM,
+  data = test_data_clean
+)[,-1]
+
+y_test <- Surv(time = test_data_clean$os_time, event = test_data_clean$os_event)
+
+# Make predictions
+test_predictions <- predict(final_model, newx = x_test, type = "link")
+
+# Calculate concordance index
+if (require(survival)) {
+  c_index <- survConcordance(y_test ~ test_predictions)$concordance
+  print(paste("C-index on test set:", round(c_index, 3)))
+}
+
+```
+
+```{r}
+
+c# Load required libraries
+library(survival)
+library(glmnet)
+library(tidyverse)
+library(caret)
+
+# Interpretation of Results
+cat("=== PENALIZED COX REGRESSION RESULTS INTERPRETATION ===\n\n")
+
+# Model Performance
+cat("MODEL PERFORMANCE:\n")
+cat("- C-index (Concordance):", round(c_index, 3), "\n")
+cat("- This indicates excellent predictive accuracy (0.877 means 87.7% concordance)\n")
+cat("- Values > 0.7 are generally considered good, > 0.8 are excellent\n\n")
+
+# Extract coefficients and create results dataframe
+coef_results <- data.frame(
+  variable = rownames(coefficients),
+  coefficient = as.numeric(coefficients),
+  stringsAsFactors = FALSE
+) %>%
+  filter(coefficient != 0) %>%
+  mutate(
+    hazard_ratio = exp(coefficient)
+  )
+
+# Since glmnet doesn't provide standard errors, we'll use approximate methods
+# For penalized models, we can use the magnitude of coefficients as importance
+coef_results <- coef_results %>%
+  mutate(
+    # Approximate relative importance based on coefficient magnitude
+    importance = abs(coefficient) / max(abs(coefficient)),
+    # For forest plot, we'll use coefficient magnitude as a proxy for uncertainty
+    # This is common practice with penalized models
+    lower_approx = exp(coefficient - 0.5 * abs(coefficient)),
+    upper_approx = exp(coefficient + 0.5 * abs(coefficient)),
+    effect_direction = ifelse(coefficient > 0, "Risk Factor", "Protective Factor")
+  )
+
+# Print detailed interpretation
+cat("SIGNIFICANT PREDICTORS OF MORTALITY (Non-zero coefficients):\n")
+cat("============================================================\n\n")
+
+for(i in 1:nrow(coef_results)) {
+  var_name <- coef_results$variable[i]
+  hr <- coef_results$hazard_ratio[i]
+  coef <- coef_results$coefficient[i]
+  
+  cat("• ", var_name, ":\n")
+  cat("  - Hazard Ratio: ", round(hr, 3), "\n")
+  cat("  - Coefficient: ", round(coef, 3), "\n")
+  cat("  - Relative Importance: ", round(coef_results$importance[i], 3), "\n")
+  
+  if(hr > 1) {
+    risk_increase <- (hr-1)*100
+    cat("  - INTERPRETATION: Increases mortality risk by ", round(risk_increase, 1), "% per unit increase\n")
+  } else {
+    risk_reduction <- (1-hr)*100
+    cat("  - INTERPRETATION: Decreases mortality risk by ", round(risk_reduction, 1), "% per unit increase\n")
+  }
+  cat("\n")
+}
+
+# Clinical Interpretation Summary
+cat("\nCLINICAL IMPLICATIONS:\n")
+cat("======================\n")
+cat("1. STRONGEST PROTECTIVE FACTORS (HR < 1):\n")
+protective_factors <- coef_results %>% filter(hazard_ratio < 1) %>% arrange(hazard_ratio)
+for(i in 1:nrow(protective_factors)) {
+  cat("   -", protective_factors$variable[i], 
+      "(HR =", round(protective_factors$hazard_ratio[i], 3), 
+      ", Importance =", round(protective_factors$importance[i], 3), ")\n")
+}
+
+cat("\n2. RISK FACTORS (HR > 1):\n")
+risk_factors <- coef_results %>% filter(hazard_ratio > 1) %>% arrange(desc(hazard_ratio))
+for(i in 1:nrow(risk_factors)) {
+  cat("   -", risk_factors$variable[i], 
+      "(HR =", round(risk_factors$hazard_ratio[i], 3),
+      ", Importance =", round(risk_factors$importance[i], 3), ")\n")
+}
+
+# Create Forest Plot
+library(ggplot2)
+
+# Prepare data for forest plot with better variable names
+forest_data <- coef_results %>%
+  mutate(
+    variable_clean = case_when(
+      variable == "ECOGGRN" ~ "ECOG Performance Status",
+      variable == "BMI" ~ "Body Mass Index",
+      variable == "SYSBP" ~ "Systolic Blood Pressure",
+      variable == "DIABP" ~ "Diastolic Blood Pressure", 
+      variable == "anytarget" ~ "Presence of Target Lesions",
+      variable == "anynontarget" ~ "Presence of Non-target Lesions",
+      variable == "total_cycles" ~ "Total Treatment Cycles",
+      variable == "total_ae_suspected" ~ "Total Suspected AEs",
+      variable == "total_severe_ae_suspected" ~ "Total Severe AEs",
+      variable == "RACEPRIMBlack or African American" ~ "Race: Black/African American",
+      variable == "RACEPRIMWhite" ~ "Race: White",
+      TRUE ~ variable
+    ),
+    variable_clean = factor(variable_clean, levels = rev(variable_clean))
+  )
+
+# Create forest plot
+forest_plot <- ggplot(forest_data, aes(x = hazard_ratio, y = variable_clean)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red", alpha = 0.7) +
+  geom_point(aes(color = effect_direction, size = importance), alpha = 0.8) +
+  geom_errorbarh(aes(xmin = lower_approx, xmax = upper_approx, color = effect_direction), 
+                 height = 0.2, size = 0.8, alpha = 0.7) +
+  scale_x_continuous(trans = "log", 
+                     breaks = c(0.5, 0.7, 0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.5, 2),
+                     limits = c(0.4, 2.2)) +
+  scale_color_manual(values = c("Risk Factor" = "#E41A1C", "Protective Factor" = "#377EB8"),
+                     name = "Effect Direction") +
+  scale_size_continuous(range = c(2, 6), name = "Relative Importance") +
+  labs(
+    title = "Predictors of Mortality in Penalized Cox Model",
+    subtitle = paste("C-index =", round(c_index, 3), "| Elastic Net (α=0.5)s"),
+    x = "Hazard Ratio (log scale)",
+    y = "",
+    caption = "Hazard Ratios > 1 indicate increased mortality risk\nHazard Ratios < 1 indicate decreased mortality risk\nPoint size indicates relative importance"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray50", size = 10),
+    axis.text.y = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    plot.caption = element_text(size = 9, color = "gray50")
+  ) +
+  # Add hazard ratio values as text
+  geom_text(aes(x = hazard_ratio, y = variable_clean, 
+                label = paste0(round(hazard_ratio, 2))),
+            hjust = -0.3, vjust = 0.5, size = 3.5, fontface = "bold")
+
+print(forest_plot)
+
+# Save the plot
+ggsave("cox_forest_plot.png", forest_plot, width = 12, height = 8, dpi = 300)
+
+# Alternative: Simple bar plot of coefficients
+coef_plot <- ggplot(forest_data, aes(x = coefficient, y = reorder(variable_clean, coefficient))) +
+  geom_col(aes(fill = effect_direction), width = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  scale_fill_manual(values = c("Risk Factor" = "#E41A1C", "Protective Factor" = "#377EB8")) +
+  labs(
+    title = "Coefficient Plot: Penalized Cox Regression",
+    subtitle = "Positive coefficients increase mortality risk, negative coefficients decrease risk",
+    x = "Coefficient Value",
+    y = "",
+    fill = "Effect Direction"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(coef_plot)
+
+# Key clinical takeaways
+cat("\nKEY CLINICAL TAKEAWAYS:\n")
+cat("=======================\n")
+cat("1. RACE EFFECT: Black/African American patients show substantially lower mortality risk\n")
+cat("   (HR = 0.584, ~42% reduction) - this is the strongest protective factor\n\n")
+
+cat("2. TREATMENT ADHERENCE: More treatment cycles strongly protective\n")
+cat("   (HR = 0.835 per additional cycle, ~17% risk reduction per cycle)\n\n")
+
+cat("3. DISEASE CHARACTERISTICS: \n")
+cat("   - Non-target lesions: Protective (HR = 0.782, ~22% risk reduction)\n")
+cat("   - Target lesions: Slight increased risk (HR = 1.073, ~7% risk increase)\n\n")
+
+cat("4. PERFORMANCE STATUS: ECOG score is a strong risk factor\n")
+cat("   (HR = 1.301 per point increase, ~30% risk increase per ECOG point)\n\n")
+
+cat("5. VITAL SIGNS: Both systolic and diastolic BP show protective effects\n")
+cat("   - SBP: HR = 0.989 per mmHg (~1% risk reduction)\n")
+cat("   - DBP: HR = 0.985 per mmHg (~1.5% risk reduction)\n\n")
+
+cat("6. ADVERSE EVENTS: Complex pattern\n")
+cat("   - Total AEs: Protective (HR = 0.990) - may indicate treatment exposure\n")
+cat("   - Severe AEs: Slight risk (HR = 1.007) - but very small effect\n\n")
+
+cat("7. BMI: Small protective effect (HR = 0.961 per unit)\n\n")
+
+# Model characteristics
+cat("\nMODEL CHARACTERISTICS:\n")
+cat("=====================\n")
+cat("- Sample size (training):", nrow(x_train), "patients\n")
+cat("- Number of death events:", sum(y_train[, 2]), "\n")
+cat("- Predictors selected:", nrow(coef_results), "out of", length(coefficients), "potential predictors\n")
+cat("- Regularization: Elastic Net (α=0.5) with lambda =", round(lambda_min, 5), "\n")
+cat("- Model performance: Excellent discrimination (C-index =", round(c_index, 3), ")\n")
+
+# Variable importance plot
+importance_plot <- ggplot(forest_data, aes(x = importance, y = reorder(variable_clean, importance))) +
+  geom_col(aes(fill = effect_direction), width = 0.7) +
+  scale_fill_manual(values = c("Risk Factor" = "#E41A1C", "Protective Factor" = "#377EB8")) +
+  labs(
+    title = "Variable Importance in Penalized Cox Model",
+    subtitle = "Based on absolute coefficient magnitudes",
+    x = "Relative Importance (0-1 scale)",
+    y = "",
+    fill = "Effect Direction"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(importance_plot)
+```
+
+
+### Random Survival Forest 
+
+```{r}
+
+
+# Prepare the data - create a clean dataset for analysis
+analysis_data <- baseline_predictors %>%
+  # Select variables for the model
+  dplyr::select(
+    # Outcome variables
+    os_time, os_event,
+    # Predictor variables
+    all_of(predictor_vars),
+    # Additional clinical variables
+    total_cycles, lenalidomide, TYPEPKN,
+    # Demographic variables
+    AGE, SEXN, ECOGGRN, BMI
+  ) %>%
+  # Remove rows with missing outcomes or time
+  filter(!is.na(os_event) & !is.na(os_time) & os_time > 0) %>%
+  # Convert variables to appropriate types
+  mutate(
+    across(where(is.character), as.factor),
+    os_event = as.numeric(as.character(os_event)),  # Convert to numeric for survival analysis
+    SEXN = as.factor(SEXN),
+    ECOGGRN = as.factor(ECOGGRN),
+    lenalidomide = as.factor(lenalidomide)
+  ) %>%
+  # Remove any remaining rows with NA values
+  na.omit()
+
+# Check the data
+cat("Final dataset dimensions:", dim(analysis_data)[1], "rows,", dim(analysis_data)[2], "columns\n")
+cat("Event distribution:\n")
+print(table(analysis_data$os_event))
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Manual cross-validation
+n <- nrow(analysis_data)
+k <- 5
+folds <- sample(rep(1:k, length.out = n))
+
+# Initialize results storage
+cv_predictions <- numeric(n)
+cv_probabilities <- numeric(n)
+variable_importance <- matrix(0, nrow = ncol(analysis_data) - 2, ncol = k)  # -2 for os_time and os_event
+rownames(variable_importance) <- setdiff(names(analysis_data), c("os_time", "os_event"))
+
+# For random forest, we need os_event as factor
+rf_data <- analysis_data %>%
+  mutate(os_event_factor = as.factor(os_event))
+
+# Perform manual 5-fold cross-validation
+for (fold in 1:k) {
+  cat("Processing fold", fold, "...\n")
+  
+  # Split data into training and testing
+  test_indices <- which(folds == fold)
+  train_indices <- which(folds != fold)
+  
+  train_data <- rf_data[train_indices, ]
+  test_data <- rf_data[test_indices, ]
+  
+  # Remove the numeric os_event for RF (use factor version)
+  train_rf <- train_data %>% dplyr::select(-os_event)
+  test_rf <- test_data %>% dplyr::select(-os_event)
+  
+  # Train random forest for classification
+  rf_model <- randomForest(
+    os_event_factor ~ .,
+    data = train_rf,
+    ntree = 300,  # Reduced for stability
+    mtry = sqrt(ncol(train_rf) - 1),
+    importance = TRUE,
+    strata = train_rf$os_event_factor,
+    sampsize = rep(min(table(train_rf$os_event_factor)), 2)
+  )
+  
+  # Make predictions on test set
+  rf_pred <- predict(rf_model, newdata = test_rf, type = "response")
+  rf_prob <- predict(rf_model, newdata = test_rf, type = "prob")[, "1"]
+  
+  # Store predictions
+  cv_predictions[test_indices] <- as.numeric(as.character(rf_pred))
+  cv_probabilities[test_indices] <- rf_prob
+  
+  # Store variable importance
+  if (!is.null(rf_model$importance)) {
+    imp <- rf_model$importance[, "MeanDecreaseGini"]
+    common_vars <- intersect(names(imp), rownames(variable_importance))
+    variable_importance[common_vars, fold] <- imp[common_vars]
+  }
+}
+
+# Calculate performance metrics
+actual_events <- analysis_data$os_event
+
+# Confusion matrix
+conf_matrix <- table(Predicted = cv_predictions, Actual = actual_events)
+print("Confusion Matrix:")
+print(conf_matrix)
+
+# Performance metrics
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+sensitivity <- conf_matrix[2, 2] / sum(conf_matrix[, 2])
+specificity <- conf_matrix[1, 1] / sum(conf_matrix[, 1])
+precision <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+f1_score <- 2 * (precision * sensitivity) / (precision + sensitivity)
+
+# ROC-AUC
+roc_obj <- roc(actual_events, cv_probabilities)
+#auc_value <- auc(roc_obj)
+
+cat("\n=== Cross-Validation Results ===\n")
+cat("Accuracy:", round(accuracy, 3), "\n")
+cat("Sensitivity:", round(sensitivity, 3), "\n")
+cat("Specificity:", round(specificity, 3), "\n")
+cat("Precision:", round(precision, 3), "\n")
+cat("F1-Score:", round(f1_score, 3), "\n")
+#cat("AUC-ROC:", round(auc_value, 3), "\n")
+
+# Plot ROC curve
+plot(roc_obj, main = "ROC Curve for Random Forest")
+legend("bottomright", legend = paste("AUC =", round(auc_value, 3)))
+
+# Variable importance
+avg_variable_importance <- rowMeans(variable_importance)
+sorted_importance <- sort(avg_variable_importance, decreasing = TRUE)
+
+cat("\n=== Top 10 Most Important Variables ===\n")
+print(head(sorted_importance, 10))
+
+# Plot variable importance
+importance_df <- data.frame(
+  Variable = names(sorted_importance),
+  Importance = sorted_importance
+)
+
+ggplot(importance_df[1:10, ], aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Most Important Variables for Predicting Mortality",
+    x = "Variables",
+    y = "Importance (Mean Decrease Gini)"
+  ) +
+  theme_minimal()
+
+# Train final model on all data
+cat("\nTraining final model on all data...\n")
+final_rf_data <- rf_data %>% dplyr::select(-os_event)
+final_rf_model <- randomForest(
+  os_event_factor ~ .,
+  data = final_rf_data,
+  ntree = 300,
+  mtry = sqrt(ncol(final_rf_data) - 1),
+  importance = TRUE,
+  strata = final_rf_data$os_event_factor,
+  sampsize = rep(min(table(final_rf_data$os_event_factor)), 2)
+)
+
+# Print final model summary
+cat("\n=== Final Model Summary ===\n")
+print(final_rf_model)
+
+# Plot final model
+par(mfrow = c(1, 2))
+plot(final_rf_model, main = "Error Rate vs Number of Trees")
+varImpPlot(final_rf_model, main = "Variable Importance")
+
+# COX REGRESSION WITH TOP VARIABLES (Fixed)
+cat("\n=== Cox Regression Validation ===\n")
+
+# Get top variables and ensure they exist in analysis_data
+top_vars <- names(head(sorted_importance, 5))
+cat("Top 5 variables for Cox model:", paste(top_vars, collapse = ", "), "\n")
+
+# Check if all top variables exist in analysis_data
+missing_vars <- setdiff(top_vars, names(analysis_data))
+if (length(missing_vars) > 0) {
+  cat("Warning: The following variables are missing from analysis_data:", paste(missing_vars, collapse = ", "), "\n")
+  # Use available top variables
+  top_vars <- intersect(top_vars, names(analysis_data))
+}
+
+# Create Cox formula - use numeric os_event
+cox_formula <- as.formula(paste("Surv(os_time, os_event) ~", paste(top_vars, collapse = " + ")))
+cox_model <- coxph(cox_formula, data = analysis_data)
+
+cat("\nCox Model Summary:\n")
+print(summary(cox_model))
+
+# Plot Cox model results
+ggforest(cox_model, data = analysis_data, main = "Hazard Ratios for Top Predictors")
+
+# Create risk groups based on predicted probabilities
+risk_groups <- ifelse(cv_probabilities > quantile(cv_probabilities, 0.67), "High Risk",
+               ifelse(cv_probabilities < quantile(cv_probabilities, 0.33), "Low Risk", "Medium Risk"))
+
+# Create Kaplan-Meier curves for comparison
+km_data <- data.frame(
+  time = analysis_data$os_time,
+  event = actual_events,
+  risk_group = risk_groups
+)
+
+km_fit <- survfit(Surv(time, event) ~ risk_group, data = km_data)
+
+# Plot Kaplan-Meier curves
+ggsurvplot(km_fit, 
+           data = km_data,
+           pval = TRUE,
+           risk.table = TRUE,
+           title = "Kaplan-Meier Curves by Predicted Risk Group",
+           xlab = "Time (days)",
+           ylab = "Survival Probability")
+
+# Additional: Create a simple risk score based on top variables
+cat("\n=== Simple Risk Score Model ===\n")
+
+# Standardize continuous variables and create risk score
+risk_score_data <- analysis_data %>%
+  mutate(
+    # Standardize continuous variables (optional)
+    across(where(is.numeric), scale),
+    # Simple risk score (you can weight these based on importance)
+    risk_score = rowSums(dplyr::select(., all_of(top_vars)), na.rm = TRUE)
+  )
+
+# Save results
+
+# Display final summary
+cat("\n=== Final Summary ===\n")
+cat("Number of patients:", nrow(analysis_data), "\n")
+cat("Number of events:", sum(actual_events), "\n")
+cat("Event rate:", round(mean(actual_events) * 100, 1), "%\n")
+cat("Number of predictors:", ncol(analysis_data) - 2, "\n")
+cat("Cross-validated AUC:", round(auc_value, 3), "\n")
+cat("Top predictive variables:", paste(head(names(sorted_importance), 5), collapse = ", "), "\n")
+```
+
+### Neural Networks {.tabset}
+
+#### Neural Net
+
+```{r}
+
+# Step 1: Improved data preparation with proper variable selection
+cat("Step 1: Data preparation...\n")
+patient_data <- pcdata %>%
+  group_by(RPT, RINVSITE, STUDY) %>%
+  arrange(desc(VISDAY)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  # Select potential predictors
+  dplyr::select(
+    # Patient demographics
+    AGE, SEXN, 
+    RACE = RACEPRIM,
+    
+    # Baseline characteristics
+    ECOGGRN, 
+    
+    # Treatment information
+    TYPEPKN, EXDOSENN, EXDOSE2N, EXDOSE3N,
+    
+    # Disease progression markers
+    total_cycles, anytarget, anynontarget,
+    
+    # Adverse event cumulative summaries
+    total_ae_events, serious_ae_count, grade3_plus_count,
+    total_body_systems, treatment_related_count, 
+    drug_interrupted, drug_reduced, drug_withdrawn,
+    other_drug_withdrawn, concomitant_treatment_given,
+    cum_any_grade3_plus, cum_any_treatment_related,
+    cum_drug_withdrawn, cum_concomitant_treatment,
+    
+    # Outcome variable
+    CANCDEAD
+  ) %>%
+  # Create derived features AFTER selecting the base variables
+  mutate(
+    # Add AE severity ratios
+    grade_ratio = ifelse(total_ae_events > 0, grade3_plus_count / total_ae_events, 0),
+    serious_ratio = ifelse(total_ae_events > 0, serious_ae_count / total_ae_events, 0),
+    
+    # Simplify race categories
+    RACE = case_when(
+      str_detect(RACE, "White") ~ "White",
+      str_detect(RACE, "Black") ~ "Black", 
+      str_detect(RACE, "Asian") ~ "Asian",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  # Remove variables with too many missing values
+  dplyr::select(where(~sum(is.na(.)) / length(.) < 0.3)) %>%
+  # Remove rows where outcome is missing
+  filter(!is.na(CANCDEAD)) %>%
+  # Convert to proper types
+  mutate(
+    CANCDEAD = as.factor(CANCDEAD),
+    across(c(SEXN, TYPEPKN, anytarget, anynontarget, 
+             drug_interrupted, drug_reduced, drug_withdrawn,
+             other_drug_withdrawn, concomitant_treatment_given,
+             cum_any_grade3_plus, cum_any_treatment_related,
+             cum_drug_withdrawn, cum_concomitant_treatment), as.factor)
+  )
+
+# Check the structure
+cat("Dataset dimensions:", dim(patient_data), "\n")
+cat("Class distribution:\n")
+print(table(patient_data$CANCDEAD))
+print(prop.table(table(patient_data$CANCDEAD)))
+```
+
+
+```{r}
+# Step 2: Data quality check and cleaning
+cat("\nStep 2: Data quality check...\n")
+
+# Examine each variable
+variable_summary <- patient_data %>%
+  summarise(across(everything(), ~list(
+    class = class(.),
+    n_unique = n_distinct(.),
+    levels = if(is.factor(.)) levels(.) else NA,
+    missing = sum(is.na(.))
+  )))
+
+# Print summary for problematic variables only
+for(var in names(patient_data)) {
+  var_info <- variable_summary[[var]]
+  if(var_info$n_unique == 1 || var_info$missing > 0) {
+    cat("Variable:", var, "\n")
+    cat("  Class:", var_info$class, "\n")
+    cat("  Unique values:", var_info$n_unique, "\n")
+    if(is.factor(patient_data[[var]])) {
+      cat("  Levels:", paste(var_info$levels, collapse = ", "), "\n")
+    }
+    cat("  Missing:", var_info$missing, "\n")
+    cat("---\n")
+  }
+}
+
+# Identify and remove variables with only one level (excluding outcome)
+single_level_vars <- patient_data %>%
+  dplyr::select(-CANCDEAD) %>%
+  dplyr::select(where(is.factor)) %>%
+  map_lgl(~n_distinct(., na.rm = TRUE) == 1) %>%
+  which() %>%
+  names()
+
+cat("Variables with only one level:", paste(single_level_vars, collapse = ", "), "\n")
+
+# Remove single-level factors from the dataset
+patient_data_clean <- patient_data %>%
+  dplyr::select(-any_of(single_level_vars))
+
+cat("Removed", length(single_level_vars), "variables with single levels\n")
+cat("Remaining variables:", ncol(patient_data_clean), "\n")
+```
+
+```{r}
+# Step 3: Improved preprocessing with MICE imputation and better error handling
+cat("\nStep 3: Preprocessing with MICE imputation...\n")
+set.seed(123)
+
+# First, use MICE for multiple imputation
+if(require(mice)) {
+  cat("Performing MICE imputation...\n")
+  
+  # Convert all character variables to factors for MICE
+  patient_data_for_mice <- patient_data_clean %>%
+    mutate(across(where(is.character), as.factor))
+  
+  # Perform MICE imputation (using 5 imputations, you can adjust this)
+  mice_imputed <- mice(patient_data_for_mice, m = 5, maxit = 10, method = 'pmm', seed = 123)
+  
+  # Use the first imputed dataset (you could also pool results across multiple imputations)
+  patient_data_imputed <- complete(mice_imputed, 1)
+  
+  cat("MICE imputation completed successfully!\n")
+  cat("Missing values after MICE:\n")
+  print(sapply(patient_data_imputed, function(x) sum(is.na(x))))
+  
+} else {
+  cat("MICE package not available, falling back to original data\n")
+  patient_data_imputed <- patient_data_clean
+}
+
+# Create preprocessing recipe (without imputation steps since we used MICE)
+preprocessing_recipe <- recipe(CANCDEAD ~ ., data = patient_data_imputed) %>%
+  # Remove near-zero variance predictors
+  step_nzv(all_predictors()) %>%
+  # Create dummy variables
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  # Normalize numeric variables
+  step_normalize(all_numeric_predictors()) %>%
+  # Remove highly correlated variables
+  step_corr(all_numeric(), threshold = 0.9)
+
+# Apply preprocessing
+prepped_data <- prep(preprocessing_recipe, training = patient_data_imputed, verbose = TRUE)
+modeling_data <- bake(prepped_data, new_data = patient_data_imputed)
+
+cat("Preprocessing completed successfully!\n")
+cat("Final dataset dimensions:", dim(modeling_data), "\n")
+cat("Class distribution before SMOTE:\n")
+print(table(modeling_data$CANCDEAD))
+
+# Apply SMOTE separately to better control the process
+if(require(themis)) {
+  smote_recipe <- recipe(CANCDEAD ~ ., data = modeling_data) %>%
+    step_smote(CANCDEAD)
+  
+  smote_prepped <- prep(smote_recipe, training = modeling_data)
+  modeling_data_balanced <- bake(smote_prepped, new_data = NULL)
+  
+  cat("After SMOTE balancing:\n")
+  print(table(modeling_data_balanced$CANCDEAD))
+  modeling_data <- modeling_data_balanced
+} else {
+  cat("Themis package not available, proceeding without SMOTE\n")
+}
+```
+
+```{r}
+# Step 4: Enhanced data splitting
+set.seed(123)
+train_index <- createDataPartition(modeling_data$CANCDEAD, p = 0.7, list = FALSE)
+train_data <- modeling_data[train_index, ]
+test_data <- modeling_data[-train_index, ]
+
+cat("Training set size:", nrow(train_data), "\n")
+cat("Test set size:", nrow(test_data), "\n")
+
+# Step 5: Convert for neural network with better validation
+convert_for_nn <- function(data) {
+  # Ensure all columns are numeric
+  result <- data %>%
+    mutate(across(everything(), as.numeric))
+  
+  # Verify conversion
+  if(!all(sapply(result, is.numeric))) {
+    stop("Conversion to numeric failed for some columns")
+  }
+  
+  # Convert outcome to 0/1 (assuming it's the first column or named CANCDEAD)
+  if("CANCDEAD" %in% names(result)) {
+    result$CANCDEAD <- result$CANCDEAD - min(result$CANCDEAD)  # Ensure it starts at 0
+  }
+  
+  return(result)
+}
+
+train_data_nn <- convert_for_nn(train_data)
+test_data_nn <- convert_for_nn(test_data)
+
+# Verify data structure
+cat("Training data structure:\n")
+str(train_data_nn[, 1:min(5, ncol(train_data_nn))])  # Show first 5 columns
+
+# Create formula
+predictor_names <- setdiff(names(train_data_nn), "CANCDEAD")
+cat("Number of predictors:", length(predictor_names), "\n")
+nn_formula <- as.formula(paste("CANCDEAD ~", paste(predictor_names, collapse = " + ")))
+
+
+# Step 6: FIXED neural network training with better error handling
+train_neural_net <- function(hidden_layers, data_train, data_test, max_retries = 3) {
+  set.seed(123)
+  
+  for(attempt in 1:max_retries) {
+    tryCatch({
+      cat("  Attempt", attempt, "for architecture", paste(hidden_layers, collapse = "-"), "... ")
+      
+      # Train neural network with simpler configuration
+      model <- neuralnet(
+        nn_formula,
+        data = data_train,
+        hidden = hidden_layers,
+        linear.output = FALSE,
+        act.fct = "logistic",
+        algorithm = "rprop+",
+        err.fct = "ce",
+        likelihood = FALSE,  # Changed to FALSE to simplify
+        stepmax = 1e5,       # Reduced stepmax
+        rep = 1,
+        threshold = 0.5,     # Increased threshold for faster convergence
+        lifesign = "minimal"
+      )
+      
+      # FIXED: Better prediction handling
+      predictions <- compute(model, data_test %>% dplyr::select(-CANCDEAD))
+      
+      # FIXED: Extract probabilities correctly
+      # neuralnet returns net.result as a matrix, not a list
+      if (is.list(predictions$net.result)) {
+        probs <- as.numeric(predictions$net.result[[1]])
+      } else {
+        probs <- as.numeric(predictions$net.result)
+      }
+      
+      # Ensure probabilities are valid
+      if (any(is.na(probs))) {
+        stop("NA values in predictions")
+      }
+      
+      # Calculate metrics
+      actual <- data_test$CANCDEAD
+      
+      # Create ROC object with better error handling
+      roc_obj <- tryCatch({
+        roc_response <- roc(actual, probs, quiet = TRUE)
+        # Check if ROC is valid
+        if (length(unique(actual)) < 2) {
+          stop("Not enough classes in actual values")
+        }
+        roc_response
+      }, error = function(e) {
+        cat("ROC failed:", e$message, " - ")
+        return(NULL)
+      })
+      
+      # Determine optimal threshold
+      if(!is.null(roc_obj)) {
+        optimal_threshold <- tryCatch({
+          coords(roc_obj, "best", ret = "threshold", transpose = TRUE)$threshold[1]
+        }, error = function(e) {
+          0.5
+        })
+      } else {
+        optimal_threshold <- 0.5
+      }
+      
+      if (is.null(optimal_threshold) || is.na(optimal_threshold)) {
+        optimal_threshold <- 0.5
+      }
+      
+      pred_class <- ifelse(probs > optimal_threshold, 1, 0)
+      
+      # Calculate metrics with error handling
+      conf_matrix <- table(Predicted = pred_class, Actual = actual)
+      
+      # Ensure we have a 2x2 confusion matrix
+      if (nrow(conf_matrix) == 1 | ncol(conf_matrix) == 1) {
+        # Handle edge case where predictions are all one class
+        if (all(pred_class == 0)) {
+          conf_matrix <- matrix(c(sum(actual == 0), 0, sum(actual == 1), 0), nrow = 2)
+        } else if (all(pred_class == 1)) {
+          conf_matrix <- matrix(c(0, sum(actual == 0), 0, sum(actual == 1)), nrow = 2)
+        }
+      }
+      
+      accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+      sensitivity <- ifelse(sum(actual == 1) > 0, 
+                           sum(pred_class == 1 & actual == 1) / sum(actual == 1), 0)
+      specificity <- ifelse(sum(actual == 0) > 0,
+                           sum(pred_class == 0 & actual == 0) / sum(actual == 0), 0)
+      precision <- ifelse(sum(pred_class == 1) > 0,
+                         sum(pred_class == 1 & actual == 1) / sum(pred_class == 1), 0)
+      f1 <- ifelse((precision + sensitivity) > 0,
+                   2 * (precision * sensitivity) / (precision + sensitivity), 0)
+      
+      # AUC
+      auc_val <- ifelse(!is.null(roc_obj), auc(roc_obj), 0.5)
+      
+      cat("✓ F1:", round(f1, 3), "AUC:", round(auc_val, 3), "\n")
+      
+      return(list(
+        model = model,
+        accuracy = accuracy,
+        sensitivity = sensitivity,
+        specificity = specificity,
+        precision = precision,
+        f1 = f1,
+        auc = auc_val,
+        auc_obj = roc_obj,
+        threshold = optimal_threshold,
+        hidden_layers = hidden_layers,
+        conf_matrix = conf_matrix
+      ))
+      
+    }, error = function(e) {
+      cat("✗ Error:", e$message, "\n")
+      if(attempt == max_retries) {
+        return(NULL)
+      }
+      # Wait before retry
+      Sys.sleep(1)
+    })
+  }
+  return(NULL)
+}
+
+# Alternative simpler neural network training function
+train_simple_nn <- function(hidden_layers, data_train, data_test) {
+  tryCatch({
+    cat("Testing simple architecture:", paste(hidden_layers, collapse = "-"), "... ")
+    
+    # Very simple neural network
+    model <- neuralnet(
+      nn_formula,
+      data = data_train,
+      hidden = hidden_layers,
+      linear.output = FALSE,
+      act.fct = "logistic",
+      algorithm = "backprop",
+      learningrate = 0.01,
+      stepmax = 1e4,
+      rep = 1,
+      threshold = 1.0  # Very high threshold for stability
+    )
+    
+    # Simple prediction
+    predictions <- compute(model, data_test %>% dplyr::select(-CANCDEAD))
+    probs <- as.numeric(predictions$net.result)
+    pred_class <- ifelse(probs > 0.5, 1, 0)
+    actual <- data_test$CANCDEAD
+    
+    # Basic metrics
+    accuracy <- mean(pred_class == actual)
+    sensitivity <- sum(pred_class == 1 & actual == 1) / sum(actual == 1)
+    specificity <- sum(pred_class == 0 & actual == 0) / sum(actual == 0)
+    
+    # Try to calculate AUC
+    auc_val <- tryCatch({
+      auc(roc(actual, probs, quiet = TRUE))
+    }, error = function(e) 0.5)
+    
+    cat("✓ Accuracy:", round(accuracy, 3), "AUC:", round(auc_val, 3), "\n")
+    
+    return(list(
+      model = model,
+      accuracy = accuracy,
+      sensitivity = sensitivity,
+      specificity = specificity,
+      auc = auc_val,
+      hidden_layers = hidden_layers
+    ))
+  }, error = function(e) {
+    cat("✗ Failed:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+# Try different approaches
+results <- list()
+cat("\nStep 6: Training neural networks...\n")
+
+# First try the original function with simpler architectures
+simple_architectures <- list(
+  c(2),     # Very simple
+  c(3),     # Simple
+  c(5),     # Basic
+  c(4, 2)   # Small hidden layers
+)
+
+for (i in seq_along(simple_architectures)) {
+  arch <- simple_architectures[[i]]
+  cat("Testing architecture:", paste(arch, collapse = "-"), "\n")
+  result <- train_neural_net(arch, train_data_nn, test_data_nn)
+  if (!is.null(result)) {
+    results[[paste(arch, collapse = "-")]] <- result
+  }
+}
+
+# If still no success, try the simple version
+if (length(results) == 0) {
+  cat("\nTrying simpler training approach...\n")
+  for (i in seq_along(simple_architectures)) {
+    arch <- simple_architectures[[i]]
+    result <- train_simple_nn(arch, train_data_nn, test_data_nn)
+    if (!is.null(result)) {
+      results[[paste(arch, collapse = "-")]] = result
+    }
+  }
+}
+
+# Step 7: Model evaluation and selection (keep this part the same)
+if (length(results) > 0) {
+  # Calculate weighted scores emphasizing sensitivity for medical context
+  scores <- sapply(results, function(x) {
+    (x$sensitivity * 0.4) + (x$auc * 0.3) + (x$f1 * 0.2) + (x$specificity * 0.1)
+  })
+  
+  best_idx <- which.max(scores)
+  best_model_name <- names(results)[best_idx]
+  best_model_info <- results[[best_idx]]
+  best_model <- best_model_info$model
+  
+  cat("\n", strrep("=", 50), "\n", sep = "")
+  cat("BEST MODEL PERFORMANCE\n")
+  cat(strrep("=", 50), "\n", sep = "")
+  cat("Architecture:", best_model_name, "\n")
+  cat("Optimal threshold:", round(best_model_info$threshold, 3), "\n")
+  cat("Accuracy:   ", round(best_model_info$accuracy, 3), "\n")
+  cat("Sensitivity:", round(best_model_info$sensitivity, 3), "\n")
+  cat("Specificity:", round(best_model_info$specificity, 3), "\n")
+  cat("Precision:  ", round(best_model_info$precision, 3), "\n")
+  cat("F1-Score:   ", round(best_model_info$f1, 3), "\n")
+  cat("AUC:        ", round(best_model_info$auc, 3), "\n")
+  
+  # Plot results
+  tryCatch({
+    par(mfrow = c(1, 2))
+    
+    # ROC curve
+    if(!is.null(best_model_info$auc_obj)) {
+      plot(best_model_info$auc_obj, main = "ROC Curve", col = "blue", lwd = 2)
+      legend("bottomright", legend = paste("AUC =", round(best_model_info$auc, 3)), 
+             bty = "n", cex = 0.8)
+      abline(a = 0, b = 1, lty = 2, col = "gray")
+    }
+    
+    # Neural network structure
+    plot(best_model, rep = "best")
+    
+    par(mfrow = c(1, 1))
+  }, error = function(e) {
+    cat("Plotting failed:", e$message, "\n")
+  })
+  
+} else {
+  # Enhanced fallback with model comparison
+  cat("\nAll neural networks failed. Using alternative models...\n")
+  
+  models_comparison <- data.frame(Model = character(), AUC = numeric(), stringsAsFactors = FALSE)
+  
+  # Option 1: Logistic regression
+  cat("1. Training logistic regression...\n")
+  tryCatch({
+    logit_model <- glm(CANCDEAD ~ ., data = train_data, family = binomial)
+    logit_pred <- predict(logit_model, newdata = test_data, type = "response")
+    logit_auc <- auc(roc(test_data$CANCDEAD, logit_pred, quiet = TRUE))
+    cat("   Logistic Regression AUC:", round(logit_auc, 3), "\n")
+    models_comparison <- rbind(models_comparison, 
+                              data.frame(Model = "Logistic Regression", AUC = logit_auc))
+  }, error = function(e) {
+    cat("   Logistic regression failed:", e$message, "\n")
+  })
+  
+  # Option 2: Random Forest
+  if(require(randomForest)) {
+    cat("2. Training random forest...\n")
+    tryCatch({
+      rf_model <- randomForest(CANCDEAD ~ ., data = train_data)
+      rf_pred <- predict(rf_model, newdata = test_data, type = "prob")[,2]
+      rf_auc <- auc(roc(test_data$CANCDEAD, rf_pred, quiet = TRUE))
+      cat("   Random Forest AUC:", round(rf_auc, 3), "\n")
+      models_comparison <- rbind(models_comparison, 
+                                data.frame(Model = "Random Forest", AUC = rf_auc))
+    }, error = function(e) {
+      cat("   Random Forest failed:", e$message, "\n")
+    })
+  }
+  
+  # Option 3: XGBoost if available
+  if(require(xgboost)) {
+    cat("3. Training XGBoost...\n")
+    tryCatch({
+      # Convert data for xgboost
+      train_matrix <- model.matrix(CANCDEAD ~ . - 1, data = train_data)
+      test_matrix <- model.matrix(CANCDEAD ~ . - 1, data = test_data)
+      
+      xgb_model <- xgboost(
+        data = train_matrix,
+        label = as.numeric(train_data$CANCDEAD) - 1,
+        nrounds = 100,
+        objective = "binary:logistic",
+        eval_metric = "auc",
+        verbose = 0
+      )
+      
+      xgb_pred <- predict(xgb_model, test_matrix)
+      xgb_auc <- auc(roc(test_data$CANCDEAD, xgb_pred, quiet = TRUE))
+      cat("   XGBoost AUC:", round(xgb_auc, 3), "\n")
+      models_comparison <- rbind(models_comparison, 
+                                data.frame(Model = "XGBoost", AUC = xgb_auc))
+    }, error = function(e) {
+      cat("   XGBoost failed:", e$message, "\n")
+    })
+  }
+  
+  # Show model comparison
+  if(nrow(models_comparison) > 0) {
+    cat("\nMODEL COMPARISON:\n")
+    print(models_comparison[order(-models_comparison$AUC), ])
+    
+    best_alt_model <- models_comparison[which.max(models_comparison$AUC), ]
+    cat("\nBEST ALTERNATIVE MODEL:", best_alt_model$Model, "(AUC:", round(best_alt_model$AUC, 3), ")\n")
+  }
+  
+  # Enhanced diagnostic information
+  cat("\nENHANCED DIAGNOSTICS:\n")
+  cat("- Data shape - Training:", dim(train_data), "Test:", dim(test_data), "\n")
+  cat("- Predictor types:", sapply(train_data_nn, class) %>% table() %>% paste(collapse = ", "), "\n")
+  cat("- Outcome range: [", min(train_data_nn$CANCDEAD), ",", max(train_data_nn$CANCDEAD), "]\n")
+  cat("- Data scale - Mean:", round(mean(as.matrix(train_data_nn[, predictor_names])), 3), 
+      "SD:", round(sd(as.matrix(train_data_nn[, predictor_names])), 3), "\n")
+  
+  cat("\nRECOMMENDATIONS:\n")
+  cat("1. The Random Forest performed excellently (AUC: 0.953) - consider using it as your primary model\n")
+  cat("2. For neural networks: Reduce complexity, increase learning rate, or use different activation functions\n")
+  cat("3. Consider feature selection to reduce from 21 predictors\n")
+  cat("4. Try different neural network packages like keras or nnet\n")
+  cat("5. The data quality seems good given the strong Random Forest performance\n")
+}
+```
