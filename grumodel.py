@@ -140,8 +140,8 @@ sequence_length = 12):
         model = models.Model(inputs, outputs)
         model.compile(optimizer='adam', loss='binary_crossentropy')
         return model
-
-    def plot_patient_trajectories(self, X, metadata, risks, threshold, num_per_group=5):
+    
+    def plot_patient_trajectories(self, X, metadata, risks, threshold, num_per_group=10):
         """Visualizes risk trajectory and predictors for sampled patients."""
         df_res = pd.DataFrame(metadata)
         df_res['risk'] = risks
@@ -157,14 +157,31 @@ sequence_length = 12):
         for pid in sampled_alarm + sampled_no_alarm:
             p_idx = df_res[df_res['pid'] == pid].index
             p_meta = df_res.loc[p_idx].sort_values('current_vday')
-            p_features = X[p_idx.values, -1, :] # Current features for each visit
+            p_features = X[p_idx.values, -1, :] 
             
-            fig, ax1 = plt.subplots(figsize=(12, 6))
+            fig, ax1 = plt.subplots(figsize=(12, 8))
             days = p_meta['current_vday'].values
             
             # Primary Axis: Risk Score
             ax1.plot(days, p_meta['risk'], color='black', lw=3, label='Mortality Risk Score', zorder=5)
             ax1.axhline(threshold, color='red', linestyle='--', alpha=0.6, label='Alarm Threshold')
+            
+            # --- New Logic: Vertical Line and Time Calculation ---
+            alarm_info = ""
+            if pid in pids_with_alarms:
+                # Find the first day the alarm was triggered
+                first_alarm_day = p_meta[p_meta['alarm'] == 1]['current_vday'].min()
+                ax1.axvline(first_alarm_day, color='orange', linestyle='-', lw=2, label='First Alarm Triggered', zorder=4)
+                
+                # Calculate time before death (assuming the last day in p_meta is the event day)
+                last_day = p_meta['current_vday'].max()
+                time_before_death = last_day - first_alarm_day
+                alarm_info = f" | Alarm Triggered {time_before_death:.1f} days before end"
+
+            # Final Status Mapping
+            status_val = p_meta['event'].iloc[0]
+            status_text = "Dead" if status_val == 1 else "Alive"
+            
             ax1.set_ylim(-0.05, 1.05)
             ax1.set_ylabel('Risk Probability', fontweight='bold')
             ax1.set_xlabel('Study Day (VISDAY)', fontweight='bold')
@@ -172,12 +189,12 @@ sequence_length = 12):
             # Secondary Axis: Predictors
             ax2 = ax1.twinx()
             for i in range(self.input_dim):
-                ax2.plot(days, p_features[:, i], alpha=0.4, label=self.feature_cols[i], linestyle=':')
+                ax2.plot(days, p_features[:, i], alpha=0.8, label=self.feature_cols[i], linestyle='--')
             
             ax2.set_ylabel('Standardized Predictor Values', alpha=0.7)
             
             group_label = "Alarm Triggered" if pid in sampled_alarm else "No Alarms"
-            plt.title(f"Patient {pid} Trajectory ({group_label})\nEvent Status: {p_meta['event'].iloc[0]}", fontweight='bold')
+            plt.title(f"Patient {pid} Trajectory ({group_label})\nFinal Status: {status_text}{alarm_info}", fontweight='bold')
             
             # Combine legends
             lines, labels = ax1.get_legend_handles_labels()
