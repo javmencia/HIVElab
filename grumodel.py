@@ -241,8 +241,7 @@ sequence_length = 12):
         y_pred = (visit_risks >= best_t).astype(int)
 
         # Visualizations
-          
-        self.report_comprehensive_metrics(y_true, y_pred, c_val)
+        self.report_comprehensive_metrics(y_true, y_pred, metadata, best_t, c_val)
         self.print_clinical_burden_metrics()
         self.calculate_calibration_stats(y_true, visit_risks)
         self.plot_performance_grid(y_true, visit_risks, best_t)
@@ -252,17 +251,69 @@ sequence_length = 12):
         self.plot_shap_summary(X) # Enhanced version called here
         self.plot_risk_sensitivity_marginal(X)
     
+    def compute_clinical_burden(self, y_true, y_pred, metadata):
+        """
+        Computes real-world utility metrics focusing on alarm density 
+        and the 'Time in Window' (TIW) / Lead Time.
+        """
+        df_burden = pd.DataFrame(metadata)
+        df_burden['y_true'] = y_true
+        df_burden['y_pred'] = y_pred
 
-    def print_clinical_burden_metrics(self):
-        print("\n" + "="*50)
-        print(f"{'Metric':<35} | {'Value':<10} | {'Category'}")
+        # 1. Alarm Density Metrics
+        total_visits = len(df_burden)
+        total_alerts = df_burden['y_pred'].sum()
+        
+        alerts_per_100 = (total_alerts / total_visits) * 100
+        prop_in_alert = (total_alerts / total_visits) * 100
+
+        # 2. Lead Time / Noise Duration (Time in Window)
+        # We look at the first alarm triggered for each patient
+        # True Positives: Alarms for patients who actually died (event=1)
+        # False Positives: Alarms for patients who survived (event=0)
+        
+        tp_lead_times = []
+        fp_noise_times = []
+
+        for pid in df_burden['pid'].unique():
+            patient_df = df_burden[df_burden['pid'] == pid].sort_values('current_vday')
+            has_event = patient_df['event'].iloc[0] == 1
+            
+            # Find first alarm
+            alarms = patient_df[patient_df['y_pred'] == 1]
+            
+            if not alarms.empty:
+                first_alarm_day = alarms['current_vday'].min()
+                last_day = patient_df['current_vday'].max()
+                duration = last_day - first_alarm_day
+                
+                if has_event:
+                    tp_lead_times.append(duration)
+                else:
+                    fp_noise_times.append(duration)
+
+        metrics = {
+            'alerts_per_100': alerts_per_100,
+            'prop_in_alert': prop_in_alert,
+            'median_tiw_tp': np.median(tp_lead_times) if tp_lead_times else 0,
+            'median_tiw_fp': np.median(fp_noise_times) if fp_noise_times else 0,
+            'count_tp_alarms': len(tp_lead_times),
+            'count_fp_alarms': len(fp_noise_times)
+        }
+
+        return metrics
+
+    def print_clinical_burden_metrics(self, metrics):
+        """Replaces the static print with dynamic data."""
+        print("\n" + "="*65)
+        print(f"{'Metric':<35} | {'Value':<12} | {'Category'}")
         print("-" * 65)
-        print(f"{'Alerts per 100 Patient-Visits':<35} | {'18.3':<10} | Clinical Burden")
-        print(f"{'Proportion of Visits in Alert':<35} | {'18.31%':<10} | Alarm Density")
-        print(f"{'Median TIW (True Positives)':<35} | {'181.0 days':<10} | Lead Time")
-        print(f"{'Median TIW (False Positives)':<35} | {'59.0 days':<10} | Noise Duration")
-        print("="*50 + "\n")
-
+        print(f"{'Alerts per 100 Patient-Visits':<35} | {metrics['alerts_per_100']:<12.2f} | Clinical Burden")
+        print(f"{'Proportion of Visits in Alert':<35} | {metrics['prop_in_alert']:<11.2f}% | Alarm Density")
+        print(f"{'Median Lead Time (True Positives)':<35} | {metrics['median_tiw_tp']:<11.1f} days | Lead Time")
+        print(f"{'Median Noise Duration (False Pos)':<35} | {metrics['median_tiw_fp']:<11.1f} days | Clinical Noise")
+        print("="*65 + "\n")
+        
     def plot_performance_grid(self, y_true, y_prob, best_t):
         fig, axes = plt.subplots(1, 4, figsize=(22, 5))
         sns.set_style("whitegrid")
@@ -376,29 +427,72 @@ sequence_length = 12):
         slope, intercept, r_value, _, _ = stats.linregress(prob_pred, prob_true)
         print(f"\nSlope: {slope:.4f} | Intercept: {intercept:.4f} | R-sq: {r_value**2:.4f}")
 
-    def report_comprehensive_metrics(self, y_true, y_pred, c_index_val):
-        cm = confusion_matrix(y_true, y_pred)
-        tn, fp, fn, tp = cm.ravel()
+    def report_comprehensive_metrics(self, y_true, y_pred, metadata, threshold, c_index_val):
         def wilson_ci(p, n, z=1.96):
             if n <= 0: return 0.0, 0.0
             denom = 1 + z**2/n
             center = (p + z**2/(2*n)) / denom
             err = z * np.sqrt((p*(1-p)/n) + (z**2/(4*n**2))) / denom
             return max(0, center - err), min(1, center + err)
+
+        # --- 1. Visit-Level Metrics (Existing) ---
+        cm_v = confusion_matrix(y_true, y_pred)
+        tn_v, fp_v, fn_v, tp_v = cm_v.ravel()
         
-        metrics = {
-            'Sensitivity (Recall)': (tp / (tp + fn), tp + fn),
-            'Specificity': (tn / (tn + fp), tn + fp),
-            'PPV (Precision)': (tp / (tp + fp) if (tp+fp)>0 else 0, tp + fp),
-            'NPV': (tn / (tn + fn) if (tn+fn)>0 else 0, tn + fn),
+        visit_metrics = {
+            'Sensitivity (Recall)': (tp_v / (tp_v + fn_v), tp_v + fn_v),
+            'Specificity': (tn_v / (tn_v + fp_v), tn_v + fp_v),
+            'PPV (Precision)': (tp_v / (tp_v + fp_v) if (tp_v+fp_v)>0 else 0, tp_v + fp_v),
+            'NPV': (tn_v / (tn_v + fn_v) if (tn_v+fn_v)>0 else 0, tn_v + fn_v),
             'Balanced Accuracy': (balanced_accuracy_score(y_true, y_pred), len(y_true))
         }
-        print("-" * 30)
-        print(f"C-Index: {c_index_val:.4f}")
-        for name, (val, n) in metrics.items():
-            low, high = wilson_ci(val, n)
-            print(f"{name:<20}: {val:.4f} [{low:.3f}, {high:.3f}]")
 
+        # --- 2. Patient-Level Metrics (New Logic) ---
+        df_eval = pd.DataFrame(metadata)
+        df_eval['y_true_visit'] = y_true
+        df_eval['y_pred_visit'] = y_pred
+        
+        # Aggregate: Patient is 'True 1' if they have an event in the horizon
+        # Patient is 'Pred 1' if flagged AT LEAST ONCE
+        patient_summary = df_eval.groupby('pid').agg({
+            'event': 'max',          # Did they ever die?
+            'y_pred_visit': 'max'    # Were they ever flagged?
+        })
+        
+        y_true_pt = patient_summary['event'].values
+        y_pred_pt = patient_summary['y_pred_visit'].values
+        
+        cm_p = confusion_matrix(y_true_pt, y_pred_pt)
+        tn_p, fp_p, fn_p, tp_p = cm_p.ravel()
+        
+        pt_metrics = {
+            'Sensitivity (Recall)': (tp_p / (tp_p + fn_p), tp_p + fn_p),
+            'Specificity': (tn_p / (tn_p + fp_p), tn_p + fp_p),
+            'PPV (Precision)': (tp_p / (tp_p + fp_p) if (tp_p+fp_p)>0 else 0, tp_p + fp_p),
+            'NPV': (tn_p / (tn_p + fn_p) if (tn_p+fn_p)>0 else 0, tn_p + fn_p),
+            'Balanced Accuracy': (balanced_accuracy_score(y_true_pt, y_pred_pt), len(y_true_pt))
+        }
+
+        # --- 3. Printing ---
+        print("\n" + "="*60)
+        print(f"COMPREHENSIVE PERFORMANCE REPORT (Threshold: {threshold:.3f})")
+        print(f"Global Concordance Index: {c_index_val:.4f}")
+        print("="*60)
+        
+        print(f"\n{'VISIT-LEVEL METRICS':<25} | {'Value':<10} | {'95% CI'}")
+        print("-" * 60)
+        for name, (val, n) in visit_metrics.items():
+            low, high = wilson_ci(val, n)
+            print(f"{name:<25} | {val:.4f}     | [{low:.3f}, {high:.3f}]")
+            
+        print(f"\n{'PATIENT-LEVEL METRICS':<25} | {'Value':<10} | {'95% CI'}")
+        print("-" * 60)
+        for name, (val, n) in pt_metrics.items():
+            low, high = wilson_ci(val, n)
+            print(f"{name:<25} | {val:.4f}     | [{low:.3f}, {high:.3f}]")
+        print("="*60 + "\n")
+
+    
     def plot_improved_analysis(self, risks, y_true, threshold):
         fig, ax1 = plt.subplots(figsize=(10, 6))
         sns.histplot(risks[y_true == 1], color='#e74c3c', label='Death', kde=True, ax=ax1, alpha=0.5)
