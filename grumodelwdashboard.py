@@ -298,11 +298,15 @@ sequence_length = 12):
         self.report_comprehensive_metrics(y_true, (visit_risks >= best_t).astype(int), metadata, best_t, c_val)
         self.report.add_text("Calibration", "h2")
         self.plot_improved_analysis(visit_risks, y_true, best_t)
-        self.calculate_calibration_stats(y_true, visit_risks)
+        burden_metrics = self.compute_clinical_burden(y_true, y_pred, metadata)
+
+        # 2. Print them
+        self.print_clinical_burden_metrics(burden_metrics)        
 
 
         self.report.add_text("Clinical Burden Metrics", "h2")
-        self.add_clinical_burden_to_report()
+        burden_metrics = self.compute_clinical_burden(y_true, y_pred, metadata)
+        self.print_clinical_burden_metrics(burden_metrics)        
 
         self.report.add_text("Model Performance Visualization", "h2")
         self.plot_performance_grid(y_true, visit_risks, best_t)
@@ -324,17 +328,94 @@ sequence_length = 12):
 
         self.report.save()
 
+    def compute_clinical_burden(self, y_true, y_pred, metadata):
+        """
+        Computes real-world utility metrics focusing on alarm density 
+        and the 'Time in Window' (TIW) / Lead Time.
+        """
+        df_burden = pd.DataFrame(metadata)
+        df_burden['y_true'] = y_true
+        df_burden['y_pred'] = y_pred
 
-    def add_clinical_burden_to_report(self):
+        # 1. Alarm Density Metrics
+        total_visits = len(df_burden)
+        total_alerts = df_burden['y_pred'].sum()
+        
+        alerts_per_100 = (total_alerts / total_visits) * 100
+        prop_in_alert = (total_alerts / total_visits) * 100
 
-        data = {
-            "Metric": ["Alerts per 100 Patient-Visits", "Proportion of Visits in Alert", "Median TIW (True Positives)", "Median TIW (False Positives)"],
-            "Value": ["18.3", "18.31%", "181.0 days", "59.0 days"],
-            "Category": ["Clinical Burden", "Alarm Density", "Lead Time", "Noise Duration"]
+        # 2. Lead Time / Noise Duration (Time in Window)
+        # We look at the first alarm triggered for each patient
+        # True Positives: Alarms for patients who actually died (event=1)
+        # False Positives: Alarms for patients who survived (event=0)
+        
+        tp_lead_times = []
+        fp_noise_times = []
+
+        for pid in df_burden['pid'].unique():
+            patient_df = df_burden[df_burden['pid'] == pid].sort_values('current_vday')
+            has_event = patient_df['event'].iloc[0] == 1
+            
+            # Find first alarm
+            alarms = patient_df[patient_df['y_pred'] == 1]
+            
+            if not alarms.empty:
+                first_alarm_day = alarms['current_vday'].min()
+                last_day = patient_df['current_vday'].max()
+                duration = last_day - first_alarm_day
+                
+                if has_event:
+                    tp_lead_times.append(duration)
+                else:
+                    fp_noise_times.append(duration)
+
+        metrics = {
+            'alerts_per_100': alerts_per_100,
+            'prop_in_alert': prop_in_alert,
+            'median_tiw_tp': np.median(tp_lead_times) if tp_lead_times else 0,
+            'median_tiw_fp': np.median(fp_noise_times) if fp_noise_times else 0,
+            'count_tp_alarms': len(tp_lead_times),
+            'count_fp_alarms': len(fp_noise_times)
         }
 
-        self.report.add_table_from_df(pd.DataFrame(data))
+        return metrics
 
+
+    def print_clinical_burden_metrics(self, metrics):
+        """Logs metrics to console and adds them to the HTML report."""
+        # 1. Console Output (Keep for debugging)
+        print("\n" + "="*65)
+        print(f"{'Metric':<35} | {'Value':<12} | {'Category'}")
+        print("-" * 65)
+        print(f"{'Alerts per 100 Patient-Visits':<35} | {metrics['alerts_per_100']:<12.2f} | Clinical Burden")
+        print(f"{'Proportion of Visits in Alert':<35} | {metrics['prop_in_alert']:<11.2f}% | Alarm Density")
+        print(f"{'Median Lead Time (True Positives)':<35} | {metrics['median_tiw_tp']:<11.1f} days | Lead Time")
+        print(f"{'Median Noise Duration (False Pos)':<35} | {metrics['median_tiw_fp']:<11.1f} days | Clinical Noise")
+        print("="*65 + "\n")
+
+        # 2. HTML Report Output
+        self.report.add_text("Clinical Burden & Alarm Density", "h2")
+        
+        # Adding as formatted headers or a summary block
+        self.report.add_text(
+            f"<b>Alerts per 100 Patient-Visits:</b> {metrics['alerts_per_100']:.2f}", "h4"
+        )
+        self.report.add_text(
+            f"<b>Proportion of Visits in Alert:</b> {metrics['prop_in_alert']:.2f}%", "h4"
+        )
+        self.report.add_text(
+            f"<b>Median Lead Time (True Positives):</b> {metrics['median_tiw_tp']:.1f} days", "h4"
+        )
+        self.report.add_text(
+            f"<b>Median Noise Duration (False Positives):</b> {metrics['median_tiw_fp']:.1f} days", "h4"
+        )
+        
+        # Optional: Add a brief contextual note to the report
+        self.report.add_text(
+            "Lead time represents the duration between the first alarm and the clinical event. "
+            "Noise duration represents the duration of alarms for patients who did not experience the event.", 
+            "p"
+        )
     def plot_performance_grid(self, y_true, y_prob, best_t):
         fig, axes = plt.subplots(1, 4, figsize=(22, 5))
         sns.set_style("whitegrid")
