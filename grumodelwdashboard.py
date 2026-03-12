@@ -69,7 +69,8 @@ features = [
     'Days Since Last Visit', 'Any Grade 3+ AE', 'Drug Dosage Reduced'
 ],
 horizon = 180,
-sequence_length = 12):
+sequence_length = 12, 
+shap_on = True):
         self.sequence_length = sequence_length
         self.horizon = horizon
         self.feature_cols = internal_columns
@@ -81,6 +82,7 @@ sequence_length = 12):
         self.autoencoder = None
         self.model = None
         self.report = HTMLReport(self.horizon)
+        self.shap_on = shap_on
 
     def train_autoencoder(self, X_with_nan):
         """Trains the autoencoder using GRU layers to reconstruct missing values."""
@@ -317,8 +319,9 @@ sequence_length = 12):
 
         self.plot_permutation_importance(X, tte, events, c_val)
 
-        self.report.add_text("SHAP Analysis", "h4")
-        self.plot_shap_summary(X) # Enhanced version called here
+        if self.shap_on:
+            self.report.add_text("SHAP Analysis", "h4")
+            self.plot_shap_summary(X) # Enhanced version called here
         self.report.add_text("Risk Sensitivity", "h4")
 
         self.plot_risk_sensitivity_marginal(X)
